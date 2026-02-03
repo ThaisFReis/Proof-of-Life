@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { TwentyOneGame } from '../games/twenty-one/TwentyOneGame';
 import { NumberGuessGame } from '../games/number-guess/NumberGuessGame';
 import { DiceDuelGame } from '../games/dice-duel/DiceDuelGame';
+import { Resources } from './Resources';
 import { useWallet } from '@/hooks/useWallet';
 import './GamesCatalog.css';
 
@@ -49,6 +50,10 @@ export function GamesCatalog() {
       target.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
   };
+
+  if (selectedGame === 'docs') {
+    return <Resources onBack={handleBackToGames} />;
+  }
 
   if (selectedGame === 'twenty-one') {
     return (
@@ -101,8 +106,8 @@ export function GamesCatalog() {
           </p>
           <div className="hero-actions">
             <button onClick={() => scrollToSection('games')}>Explore Games</button>
-            <button className="btn-secondary" onClick={() => scrollToSection('quickstart')}>
-              View Quickstart
+            <button className="btn-secondary" onClick={() => handleSelectGame('docs')}>
+              Open Docs
             </button>
           </div>
           <div className="hero-metrics">
