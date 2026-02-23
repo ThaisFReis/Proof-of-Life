@@ -1,7 +1,7 @@
 import type { SessionState } from '../model';
 
 export function shouldDisableChadCommands(params: {
-  uiPhase: 'setup' | 'boot' | 'cutscene' | 'play';
+  uiPhase: 'setup' | 'lobby' | 'boot' | 'cutscene' | 'play';
   session: SessionState | null;
   commandLocked: boolean;
   chainPipelineLocked?: boolean;

@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useRef } from 'react';
 import { AsciiMeter, CRTPanel } from './components';
 import { type ScriptEvent } from '../script/callScript';
+import cutsceneAudioUrl from '../../../assets/cutscene.mp3';
 import './CutsceneScreen.css';
 
 const Waveform = (props: { active: boolean }) => {
@@ -92,7 +93,7 @@ export function CutsceneScreen(props: {
   }, [lines]);
 
   useEffect(() => {
-    const audio = new Audio(new URL('../../../../../../assets/cutscene.mp3', import.meta.url).href);
+    const audio = new Audio(cutsceneAudioUrl);
     audio.play().catch((e) => console.error('Audio playback failed:', e));
 
     return () => {

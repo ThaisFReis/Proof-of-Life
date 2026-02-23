@@ -53,3 +53,28 @@ export type ChadCommand =
   | 'GO_GRAND_HALL';
 
 export type { EncryptedSecret } from './utils/encryption';
+
+// Lobby / two-player matchmaking types
+
+/** Serialized as "POL1-<base64>" — shared dispatcher → assassin */
+export interface LobbyCode {
+  v: 1;
+  sid: number;     // session ID
+  d: string;       // dispatcher Stellar address
+  net: string;     // network passphrase (short: "testnet" | "mainnet" | full)
+  cid: string;     // contract ID
+}
+
+/** Serialized as "POL1R-<base64>" — shared assassin → dispatcher */
+export interface LobbyResponse {
+  v: 1;
+  sid: number;     // must match LobbyCode.sid
+  a: string;       // assassin Stellar address
+}
+
+/** Phase within the lobby flow */
+export type LobbyPhase =
+  | 'choose'       // choose create / join
+  | 'create'       // dispatcher: show lobby code, wait for response
+  | 'join'         // assassin: paste lobby code, accept
+  | 'waiting';     // assassin: waiting for dispatcher to start game

@@ -1,15 +1,27 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import { AsciiTitle, CRTPanel, NeonKPI, AsciiMeter, TerminalLog, WavePane, stars, meterBar, CRTModal } from './retro-ui/components';
 import { IntroScreen } from './retro-ui/IntroScreen';
+import { LobbyScreen } from './retro-ui/LobbyScreen';
 import { CutsceneScreen } from './retro-ui/CutsceneScreen';
 import { RetroMap } from './retro-ui/RetroMap';
 import type { ChadCommand, GameMode, SessionState, TowerId } from './model';
 import { commitLocation, createSession, recharge, requestPing, setChadCommand } from './localBackend';
 import { formatPowerMeter } from './terminal/powerMeter';
-import { DEFAULT_SIM_CONFIG, createSecret, stepAfterDispatcherActionWithTrace } from './sim/engine';
+import {
+  DEFAULT_SIM_CONFIG,
+  applyManualAssassinPath,
+  createSecret,
+  prepareAssassinTurnFromAssassinPhase,
+  prepareAssassinTurnFromDispatcherAction,
+  stepAfterDispatcherActionWithTrace,
+  validateManualAssassinPath,
+  type AssassinTurnPrepared,
+  type Coord,
+  type SecretState,
+} from './sim/engine';
 import { getAvailableChadCommands } from './sim/chadOptions';
 import { getBootSequence, getIntroCallSequence } from './script/callScript';
-import { getCellPlan, isBlockedTile, isHideTile, listDoorMarkers, MAP_LABELS, ROOM_LEGEND } from './world/floorplan';
+import { getCellPlan, isBlockedTile, isChadSpawnable, isHideTile, listDoorMarkers, MAP_LABELS, ROOM_LEGEND } from './world/floorplan';
 import { appendChainLog, fakeTxHash, formatChainLine, mkChainContextFrom, type ChainLogEntry } from './chain/chainLog';
 import {
   ChainBackend,
@@ -68,6 +80,172 @@ const SESSION_KEY_SCOPE_POLL_BACKGROUND_ATTEMPTS = Number((import.meta as any)?.
 // Secure-mode proof generation + submission can exceed 30s on testnet; avoid premature lock release.
 const PIPELINE_WATCHDOG_MS = 120_000;
 const SUBTITLE_TURN_DURATION_MS = 27_000;
+
+type GameSyncMessage =
+  | {
+      type: 'assassin-turn-applied';
+      sessionId: number;
+      completedTurn: number;
+      secret: SecretState;
+    };
+
+function fnv1a32(input: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < input.length; i++) {
+    h ^= input.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return h >>> 0;
+}
+
+function deriveTwoPlayerSeed(sessionId: number, dispatcherAddr: string, assassinAddr: string, tag: string): number {
+  return fnv1a32(`${tag}|${sessionId >>> 0}|${dispatcherAddr}|${assassinAddr}`) || 1;
+}
+
+function deriveTwoPlayerChadCoord(sessionId: number, dispatcherAddr: string, assassinAddr: string): { x: number; y: number } {
+  const spawnable: { x: number; y: number }[] = [];
+  for (let y = 0; y < DEFAULT_SIM_CONFIG.gridH; y++) {
+    for (let x = 0; x < DEFAULT_SIM_CONFIG.gridW; x++) {
+      if (isChadSpawnable(x, y)) spawnable.push({ x, y });
+    }
+  }
+  if (!spawnable.length) return { ...DEFAULT_SIM_CONFIG.chadDefault };
+  const idx = deriveTwoPlayerSeed(sessionId, dispatcherAddr, assassinAddr, 'chad') % spawnable.length;
+  return spawnable[idx] ?? { ...DEFAULT_SIM_CONFIG.chadDefault };
+}
+
+function createSynchronizedSession(params: {
+  sessionId: number;
+  mode: GameMode;
+  dispatcher: string;
+  assassin: string;
+}): SessionState {
+  const s = createSession(params);
+  if (params.mode !== 'two-player') return s;
+  const chad = deriveTwoPlayerChadCoord(params.sessionId, params.dispatcher, params.assassin);
+  return { ...s, chad_x: chad.x, chad_y: chad.y };
+}
+
+function hasOnchainPublicDiff(local: SessionState, onchain: SessionState): boolean {
+  const preserveDeferredDispatcherState =
+    local.mode === 'two-player' &&
+    local.phase === 'dispatcher' &&
+    local.turn_step === 'command' &&
+    onchain.phase === 'dispatcher' &&
+    onchain.turn === local.turn;
+  const effectiveCommitmentSet = local.commitmentSet || onchain.commitmentSet;
+  return (
+    local.turn !== onchain.turn ||
+    local.phase !== onchain.phase ||
+    local.ended !== onchain.ended ||
+    (!preserveDeferredDispatcherState && local.battery !== onchain.battery) ||
+    local.alpha !== onchain.alpha ||
+    local.alpha_max !== onchain.alpha_max ||
+    local.commitmentSet !== effectiveCommitmentSet ||
+    local.chad_x !== onchain.chad_x ||
+    local.chad_y !== onchain.chad_y ||
+    local.chad_hidden !== onchain.chad_hidden ||
+    local.chad_hide_streak !== onchain.chad_hide_streak ||
+    local.insecure_mode !== onchain.insecure_mode ||
+    local.pending_ping_tower !== onchain.pending_ping_tower
+  );
+}
+
+function mergeOnchainStateIntoTwoPlayerLocal(local: SessionState, onchain: SessionState): SessionState {
+  const preserveDeferredDispatcherState =
+    local.mode === 'two-player' &&
+    local.phase === 'dispatcher' &&
+    local.turn_step === 'command' &&
+    onchain.phase === 'dispatcher' &&
+    onchain.turn === local.turn;
+  return {
+    ...local,
+    battery: preserveDeferredDispatcherState ? local.battery : onchain.battery,
+    turn: onchain.turn,
+    phase: onchain.phase,
+    turn_step: preserveDeferredDispatcherState ? local.turn_step : onchain.turn_step,
+    ended: onchain.ended,
+    // Preserve locally-armed commitment on dispatcher until the first on-chain ping proof
+    // sets the contract commitment. Otherwise the initial dispatcher controls get disabled.
+    commitmentSet: local.commitmentSet || onchain.commitmentSet,
+    alpha: onchain.alpha,
+    alpha_max: onchain.alpha_max,
+    moved_this_turn: onchain.moved_this_turn,
+    chad_x: onchain.chad_x,
+    chad_y: onchain.chad_y,
+    chad_hidden: onchain.chad_hidden,
+    chad_hide_streak: onchain.chad_hide_streak,
+    pending_ping_tower: onchain.pending_ping_tower ?? null,
+    insecure_mode: onchain.insecure_mode,
+  };
+}
+
+function matchesReplayCandidateToOnchain(candidate: SessionState, onchain: SessionState): boolean {
+  return (
+    candidate.sessionId === onchain.sessionId &&
+    candidate.dispatcher === onchain.dispatcher &&
+    candidate.assassin === onchain.assassin &&
+    candidate.turn === onchain.turn &&
+    candidate.phase === onchain.phase &&
+    candidate.ended === onchain.ended &&
+    candidate.battery === onchain.battery &&
+    candidate.commitmentSet === onchain.commitmentSet &&
+    (candidate.alpha ?? 0) === (onchain.alpha ?? 0) &&
+    (candidate.alpha_max ?? 0) === (onchain.alpha_max ?? 0) &&
+    (candidate.chad_x ?? -1) === (onchain.chad_x ?? -1) &&
+    (candidate.chad_y ?? -1) === (onchain.chad_y ?? -1) &&
+    !!candidate.chad_hidden === !!onchain.chad_hidden &&
+    (candidate.chad_hide_streak ?? 0) === (onchain.chad_hide_streak ?? 0)
+  );
+}
+
+function tryReplayAssassinSyncTurn(params: {
+  local: SessionState;
+  secret: EncryptedSecret;
+  onchain: SessionState;
+}): { session: SessionState; secret: EncryptedSecret } | null {
+  const { local, secret, onchain } = params;
+  if (local.mode !== 'two-player') return null;
+  if (local.ended || onchain.ended) return null;
+  if (local.phase !== 'dispatcher' || local.turn_step !== 'action') return null;
+  if (onchain.phase !== 'dispatcher') return null;
+  if (onchain.turn !== local.turn + 1) return null;
+
+  const baseSecret = encryption.decrypt(secret);
+  const actionCandidates: SessionState[] = [];
+
+  const pingState = requestPing(local, local.dispatcher, 'N');
+  if (pingState.turn_step === 'command' && pingState.battery === onchain.battery) {
+    actionCandidates.push(pingState);
+  }
+
+  const rechargeState = recharge(local, local.dispatcher);
+  if (
+    rechargeState.turn_step === 'command' &&
+    rechargeState.battery === onchain.battery &&
+    !actionCandidates.some((s) => s.battery === rechargeState.battery && s.turn_step === rechargeState.turn_step)
+  ) {
+    actionCandidates.push(rechargeState);
+  }
+
+  const matches: Array<{ session: SessionState; secret: EncryptedSecret }> = [];
+
+  for (const actionState of actionCandidates) {
+    const cmds = getAvailableChadCommands(actionState);
+    for (const opt of cmds) {
+      const queued = setChadCommand(actionState, actionState.dispatcher, opt.cmd);
+      if (queued.pending_chad_cmd !== opt.cmd || queued.turn_step !== 'command') continue;
+      const out = stepAfterDispatcherActionWithTrace(queued, baseSecret, DEFAULT_SIM_CONFIG);
+      if (!matchesReplayCandidateToOnchain(out.session, onchain)) continue;
+      matches.push({
+        session: mergeOnchainStateIntoTwoPlayerLocal(out.session, onchain),
+        secret: encryption.encrypt(out.secret),
+      });
+    }
+  }
+
+  return matches[0] ?? null;
+}
 
 function getSubtitleConversationLinesForSession(session: SessionState | null): string[] {
   if (!session) return [];
@@ -158,14 +336,16 @@ export function ProofOfLifeGame(props: {
   const { wallet } = props;
   const user = props.userAddress || 'GUEST';
   const [mode, setMode] = useState<GameMode>('single');
+  const [dispatcherAddress, setDispatcherAddress] = useState('');
   const [sessionId, setSessionId] = useState(() => createRandomSessionId());
   const [showRules, setShowRules] = useState(false); // Modal State
   const [showLogs, setShowLogs] = useState(false);   // Logs Modal State
   const [assassinAddress, setAssassinAddress] = useState('');
   const [session, setSession] = useState<SessionState | null>(null);
   const [secret, setSecret] = useState<EncryptedSecret | null>(null);
-  const [uiPhase, setUiPhase] = useState<'setup' | 'boot' | 'cutscene' | 'play'>('setup');
-  const [visibleUiPhase, setVisibleUiPhase] = useState<'setup' | 'boot' | 'cutscene' | 'play'>('setup');
+  const [uiPhase, setUiPhase] = useState<'setup' | 'lobby' | 'boot' | 'cutscene' | 'play'>('setup');
+  const [visibleUiPhase, setVisibleUiPhase] = useState<'setup' | 'lobby' | 'boot' | 'cutscene' | 'play'>('setup');
+  const [lobbyRole, setLobbyRole] = useState<'dispatcher' | 'assassin' | null>(null);
   const [phaseTransition, setPhaseTransition] = useState<'idle' | 'exiting' | 'entering'>('idle');
   const [hoverDrain, setHoverDrain] = useState<string | null>(null);
   const [recharging, setRecharging] = useState(false);
@@ -179,6 +359,9 @@ export function ProofOfLifeGame(props: {
   // so the UI can keep the "PING first, then command" flow.
   const [pendingPing, setPendingPing] = useState<{ tower: TowerId; d2: number } | null>(null);
   const [lastPingResult, setLastPingResult] = useState<{ tower: TowerId; d2: number; at: number; turn: number } | null>(null);
+  const [assassinPlannedPath, setAssassinPlannedPath] = useState<Coord[]>([]);
+  const [assassinTurnBusy, setAssassinTurnBusy] = useState(false);
+  const [assassinTurnError, setAssassinTurnError] = useState<string | null>(null);
   const [commandLocked, setCommandLocked] = useState(false);
   const [chainPipelineLocked, setChainPipelineLocked] = useState(false);
   const [onchainMutationLocked, setOnchainMutationLocked] = useState(false);
@@ -206,6 +389,12 @@ export function ProofOfLifeGame(props: {
   const chainLogScrollRef = useRef<HTMLDivElement>(null);
   const phaseExitTimerRef = useRef<number | null>(null);
   const phaseEnterTimerRef = useRef<number | null>(null);
+  const latestSessionRef = useRef<SessionState | null>(null);
+  const latestSecretRef = useRef<EncryptedSecret | null>(null);
+  const assassinSyncPollBusyRef = useRef(false);
+  const assassinSyncWarnedTurnRef = useRef<number | null>(null);
+  const assassinSyncLastErrorRef = useRef<{ msg: string; at: number } | null>(null);
+  const assassinSubmitBusyRef = useRef(false);
   const phaseTransitionMs = 220;
   useEffect(() => {
     const el = chainLogScrollRef.current;
@@ -243,6 +432,14 @@ export function ProofOfLifeGame(props: {
       if (dialogueUnlockTimerRef.current) window.clearTimeout(dialogueUnlockTimerRef.current);
     };
   }, []);
+
+  useEffect(() => {
+    latestSessionRef.current = session;
+  }, [session]);
+
+  useEffect(() => {
+    latestSecretRef.current = secret;
+  }, [secret]);
 
   const prover = useMemo(() => {
     const url = (import.meta as any)?.env?.VITE_ZK_PROVER_URL ?? 'http://127.0.0.1:8788';
@@ -326,8 +523,82 @@ export function ProofOfLifeGame(props: {
     );
   };
 
-  const dispatcher = user;
-  const assassin = mode === 'single' ? user : assassinAddress.trim() || 'UNKNOWN';
+  const activeMode = session?.mode ?? mode;
+  const dispatcher = activeMode === 'single' ? user : dispatcherAddress.trim() || user;
+  const assassin = activeMode === 'single' ? user : assassinAddress.trim() || 'UNKNOWN';
+  const playerRole: 'dispatcher' | 'assassin' | 'observer' =
+    activeMode === 'single'
+      ? 'dispatcher'
+      : user === dispatcher
+        ? 'dispatcher'
+        : user === assassin
+          ? 'assassin'
+          : (lobbyRole ?? 'observer');
+  const isDispatcherClient = playerRole === 'dispatcher';
+  const isAssassinClient = playerRole === 'assassin';
+  const manualAssassinControlEnabled = activeMode === 'two-player';
+  const assassinClientByRole = isAssassinClient || lobbyRole === 'assassin';
+  const chadHiddenForMap =
+    activeMode === 'two-player' &&
+    !!session &&
+    (
+      !!session.chad_hidden ||
+      !!(session.chad_hide_streak && session.chad_hide_streak > 0) ||
+      (typeof session.chad_x === 'number' && typeof session.chad_y === 'number' && isHideTile(session.chad_x, session.chad_y))
+    );
+  const shouldShowChadMarkerOnMap = !chadHiddenForMap;
+  const secretState = useMemo<SecretState | null>(() => {
+    if (!secret) return null;
+    try {
+      return encryption.decrypt(secret);
+    } catch {
+      return null;
+    }
+  }, [secret]);
+  const assassinTurnPrepared = useMemo<AssassinTurnPrepared | null>(() => {
+    if (!manualAssassinControlEnabled || !isAssassinClient) return null;
+    if (!session || !secretState) return null;
+    return prepareAssassinTurnFromAssassinPhase(session, secretState, DEFAULT_SIM_CONFIG);
+  }, [manualAssassinControlEnabled, isAssassinClient, session, secretState]);
+  const assassinPathValidation = useMemo(() => {
+    if (!assassinTurnPrepared) return null;
+    return validateManualAssassinPath(assassinTurnPrepared, assassinPlannedPath, DEFAULT_SIM_CONFIG);
+  }, [assassinTurnPrepared, assassinPlannedPath]);
+  const assassinTurnCanSubmit =
+    !!assassinTurnPrepared &&
+    !!assassinPathValidation?.ok &&
+    !assassinTurnBusy &&
+    !onchainBootstrapPending &&
+    !onchainMutationLocked &&
+    !chainPipelineLocked &&
+    uiPhase === 'play' &&
+    !!chainBackend &&
+    onchainGameplayEnabled &&
+    onchainSessionHealthy;
+
+  useEffect(() => {
+    if (typeof BroadcastChannel === 'undefined') return;
+    const bc = new BroadcastChannel('pol-game-sync');
+    bc.onmessage = (ev: MessageEvent<GameSyncMessage>) => {
+      const msg = ev.data;
+      if (!msg || msg.type !== 'assassin-turn-applied') return;
+      const cur = latestSessionRef.current;
+      if (!cur || cur.mode !== 'two-player') return;
+      if ((cur.sessionId >>> 0) !== (msg.sessionId >>> 0)) return;
+      if (isAssassinClient) return;
+      setSecret(encryption.encrypt(msg.secret));
+      setChainLog((l) =>
+        appendChainLog(l, {
+          ts: Date.now(),
+          level: 'INFO',
+          msg: `SYNC: received assassin state for turn ${msg.completedTurn} via local tab channel`,
+        }, 240)
+      );
+    };
+    return () => {
+      bc.close();
+    };
+  }, [isAssassinClient]);
 
   const power = useMemo(() => formatPowerMeter(session?.battery ?? 100), [session?.battery]);
   const controlsLocked = uiPhase !== 'play';
@@ -428,6 +699,104 @@ export function ProofOfLifeGame(props: {
     };
   }, [subtitleConversationLines]);
 
+  useEffect(() => {
+    if (!isAssassinClient || session?.mode !== 'two-player') {
+      setAssassinPlannedPath([]);
+      setAssassinTurnError(null);
+      setAssassinTurnBusy(false);
+      assassinSubmitBusyRef.current = false;
+      return;
+    }
+    if (!session || session.ended || session.phase !== 'assassin') {
+      setAssassinPlannedPath([]);
+      setAssassinTurnError(null);
+      setAssassinTurnBusy(false);
+      assassinSubmitBusyRef.current = false;
+      return;
+    }
+    setAssassinTurnError(null);
+  }, [isAssassinClient, session?.mode, session?.sessionId, session?.turn, session?.phase, session?.ended]);
+
+  useEffect(() => {
+    if (!chainBackend) return;
+    if (!session || session.mode !== 'two-player') return;
+    if (isDispatcherClient) {
+      if (uiPhase !== 'play') return;
+    } else {
+      if (uiPhase !== 'cutscene' && uiPhase !== 'play') return;
+    }
+
+    let cancelled = false;
+    let timerId: number | null = null;
+
+    const poll = async () => {
+      if (cancelled || assassinSyncPollBusyRef.current) return;
+      const curLocal = latestSessionRef.current;
+      if (!curLocal || curLocal.mode !== 'two-player') return;
+
+      assassinSyncPollBusyRef.current = true;
+      try {
+        const sid = activeSessionIdRef.current ?? curLocal.sessionId;
+        const fetched = await chainBackend.getSession(sid);
+        if (cancelled) return;
+
+        const onchain: SessionState = {
+          ...fetched,
+          mode: 'two-player',
+          dispatcher: curLocal.dispatcher,
+          assassin: curLocal.assassin,
+        };
+
+        const localNow = latestSessionRef.current;
+        if (!localNow || localNow.mode !== 'two-player') return;
+        if (!hasOnchainPublicDiff(localNow, onchain)) return;
+
+        const nextSession = mergeOnchainStateIntoTwoPlayerLocal(localNow, onchain);
+
+        if (onchain.turn > localNow.turn) {
+          if (assassinSyncWarnedTurnRef.current !== onchain.turn) {
+            assassinSyncWarnedTurnRef.current = onchain.turn;
+            setChainLog((l) =>
+              appendChainLog(l, {
+                ts: Date.now(),
+                level: 'WARN',
+                msg: `TWO-PLAYER SYNC applied for turn ${onchain.turn} (public chain state updated)`,
+              }, 240)
+            );
+          }
+        }
+
+        setSession(nextSession);
+      } catch (e) {
+        if (!cancelled) {
+          const msg = String(e);
+          const now = Date.now();
+          const last = assassinSyncLastErrorRef.current;
+          const shouldLog = !last || last.msg !== msg || (now - last.at) > 10_000;
+          if (shouldLog) {
+            assassinSyncLastErrorRef.current = { msg, at: now };
+            setChainLog((l) =>
+              appendChainLog(l, {
+                ts: now,
+                level: 'WARN',
+                msg: `TWO-PLAYER SYNC poll failed: ${msg}`,
+              }, 240)
+            );
+          }
+        }
+      } finally {
+        assassinSyncPollBusyRef.current = false;
+      }
+    };
+
+    void poll();
+    timerId = window.setInterval(() => { void poll(); }, 1800);
+    return () => {
+      cancelled = true;
+      if (timerId !== null) window.clearInterval(timerId);
+    };
+  }, [chainBackend, isDispatcherClient, session?.mode, session?.sessionId, uiPhase]);
+
   const clearPipelineFailsafe = () => {
     if (pipelineFailsafeRef.current !== null) {
       window.clearTimeout(pipelineFailsafeRef.current);
@@ -444,7 +813,7 @@ export function ProofOfLifeGame(props: {
     setOnchainMutationLocked(false);
   };
 
-  const start = (forcedSessionId?: number) => {
+  const start = (forcedSessionId?: number, overrides?: { mode?: GameMode; assassin?: string }) => {
     if (dialogueUnlockTimerRef.current !== null) {
       window.clearTimeout(dialogueUnlockTimerRef.current);
       dialogueUnlockTimerRef.current = null;
@@ -458,23 +827,29 @@ export function ProofOfLifeGame(props: {
     }
 
     const sid = typeof forcedSessionId === 'number' ? forcedSessionId : sessionId;
+    // Use overrides when called from lobby (React state may not have flushed yet).
+    const startMode = overrides?.mode ?? mode;
+    const startAssassin = overrides?.assassin ?? assassin;
     const sessionKeyPollToken = ++sessionKeyPollTokenRef.current;
     activeSessionIdRef.current = sid;
     setSessionKeySecret(null);
     setSessionKeyPublic(null);
-    const s = createSession({
+    const s = createSynchronizedSession({
       sessionId: sid,
-      mode,
+      mode: startMode,
       dispatcher,
-      assassin,
+      assassin: startAssassin,
     });
     // Start with an empty log; boot + intro script will populate it.
     // ARM IMMEDIATELY on execution
-    const armedSession = commitLocation(s, assassin);
+    const armedSession = commitLocation(s, startAssassin);
     setSession({ ...armedSession, log: [] });
     setLastPingResult(null);
     const chad = { x: s.chad_x ?? 5, y: s.chad_y ?? 5 };
-    setSecret(mode === 'single' ? encryption.encrypt(createSecret(undefined, chad)) : null);
+    const secretSeed = startMode === 'two-player'
+      ? deriveTwoPlayerSeed(sid, dispatcher, startAssassin, 'secret')
+      : undefined;
+    setSecret(encryption.encrypt(createSecret(secretSeed, chad)));
     setUiPhase('boot');
     // PROD-only: force secure mode for every session start.
     devModeSessionRef.current = false;
@@ -604,7 +979,7 @@ export function ProofOfLifeGame(props: {
               await fundSessionKeyOnTestnet(sessionKey.publicKey());
             }
             const dispatcherAllowMask = SESSION_ALLOW_DISPATCH | SESSION_ALLOW_RECHARGE | SESSION_ALLOW_LOCK_SECURE_MODE;
-            const assassinAllowMask = user === assassin
+            const assassinAllowMask = user === startAssassin
               ? (
                 SESSION_ALLOW_COMMIT_LOCATION |
                 SESSION_ALLOW_SUBMIT_PING_PROOF |
@@ -617,7 +992,7 @@ export function ProofOfLifeGame(props: {
             const r = await bootstrapBackend.startGameWithSessionKey({
               sessionId: sid,
               dispatcher,
-              assassin,
+              assassin: startAssassin,
               insecureMode: !!devModeSessionRef.current,
               delegate: sessionKey.publicKey(),
               ttlLedgers: Math.max(1, SESSION_KEY_TTL_LEDGERS),
@@ -628,7 +1003,7 @@ export function ProofOfLifeGame(props: {
             // Wallet confirmed + TX submitted — safe to start the cutscene now.
             setUiPhase('cutscene');
             let dispatcherScopeReady = false;
-            let assassinScopeReady = user !== assassin;
+            let assassinScopeReady = user !== startAssassin;
             const delegatePk = sessionKey.publicKey();
             const stillCurrentSession = () =>
               activeSessionIdRef.current === sid && sessionKeyPollTokenRef.current === sessionKeyPollToken;
@@ -659,9 +1034,9 @@ export function ProofOfLifeGame(props: {
                     role: 'Dispatcher',
                   });
                   dispatcherScopeReady = !!dScope && dScope.delegate === delegatePk;
-                  if (user === assassin) {
+                  if (user === startAssassin) {
                     const aScope = await bootstrapBackend.getSessionKeyScope({
-                      owner: assassin,
+                      owner: startAssassin,
                       sessionId: sid,
                       role: 'Assassin',
                     });
@@ -738,10 +1113,10 @@ export function ProofOfLifeGame(props: {
               })();
             }
           } else {
-            const r = await bootstrapBackend.startGame({ sessionId: sid, dispatcher, assassin });
+            const r = await bootstrapBackend.startGame({ sessionId: sid, dispatcher, assassin: startAssassin });
             // Wallet confirmed + TX submitted — safe to start the cutscene now.
             setUiPhase('cutscene');
-            setChainLog((l) => appendChainLog(l, { ts: Date.now(), level: 'INFO', msg: `TX ${r.txHash ?? 'UNKNOWN'} invoke start_game session=${sid} dispatcher=${dispatcher} assassin=${assassin}` }));
+            setChainLog((l) => appendChainLog(l, { ts: Date.now(), level: 'INFO', msg: `TX ${r.txHash ?? 'UNKNOWN'} invoke start_game session=${sid} dispatcher=${dispatcher} assassin=${startAssassin}` }));
 
             // Guard against indexing/settlement delay: ensure session is visible before mode lock.
             // Testnet can take 15-30s to settle; poll generously.
@@ -820,7 +1195,7 @@ export function ProofOfLifeGame(props: {
                 }
                 const dispatcherAllowMask = user === dispatcher ? (SESSION_ALLOW_DISPATCH | SESSION_ALLOW_RECHARGE | SESSION_ALLOW_LOCK_SECURE_MODE) : 0;
                 const assassinAllowMask =
-                  user === assassin
+                  user === startAssassin
                     ? (
                       SESSION_ALLOW_COMMIT_LOCATION |
                       SESSION_ALLOW_SUBMIT_PING_PROOF |
@@ -1018,6 +1393,10 @@ export function ProofOfLifeGame(props: {
   };
 
   const afterChadCommand = (queued: SessionState) => {
+    if (queued.mode === 'two-player' && isDispatcherClient) {
+      afterChadCommandTwoPlayerDispatcher(queued);
+      return;
+    }
     if (commandLockRef.current || chainPipelineLockRef.current || onchainMutationLockRef.current || onchainBootstrapPendingRef.current) return;
     // Prevent multiple commands being clicked in the same "command" window.
     commandLockRef.current = true;
@@ -1028,7 +1407,9 @@ export function ProofOfLifeGame(props: {
       setCommandLocked(false);
       return;
     }
-    if (queued.mode !== 'single' || !secret) {
+    // Dispatcher two-player sessions also need local turn resolution (using the dispatcher's secret).
+    // Only bail out if we truly lack the secret state.
+    if (!secret) {
       commandLockRef.current = false;
       setCommandLocked(false);
       releasePipelineLocks();
@@ -1951,6 +2332,725 @@ export function ProofOfLifeGame(props: {
     }, 700);
   };
 
+  // ── Lobby handlers ────────────────────────────────────────────────────────
+
+  const handleLobbyComplete = (params: { sessionId: number; dispatcher: string; assassin: string; role: 'dispatcher' | 'assassin' }) => {
+    setLobbyRole(params.role);
+    if (params.role === 'dispatcher') {
+      // Dispatcher: set addresses then trigger the full start() flow (on-chain bootstrap + wallet modal)
+      setMode('two-player');
+      setDispatcherAddress(params.dispatcher);
+      setAssassinAddress(params.assassin);
+      setSessionId(params.sessionId);
+      start(params.sessionId, { mode: 'two-player', assassin: params.assassin });
+    } else {
+      // Assassin: create a local session and wait for dispatcher's on-chain tx
+      joinAsAssassin(params.sessionId, params.dispatcher, params.assassin);
+    }
+  };
+
+  /** Assassin joins: set up local state and go to cutscene (no on-chain tx). */
+  const joinAsAssassin = (sid: number, dispatcherAddr: string, assassinAddr: string) => {
+    if (dialogueUnlockTimerRef.current !== null) {
+      window.clearTimeout(dialogueUnlockTimerRef.current);
+      dialogueUnlockTimerRef.current = null;
+    }
+    commandLockRef.current = false;
+    setCommandLocked(false);
+    while (timeouts.length) {
+      const id = timeouts.pop();
+      if (typeof id === 'number') window.clearTimeout(id);
+    }
+
+    setMode('two-player');
+    setDispatcherAddress(dispatcherAddr);
+    setAssassinAddress(assassinAddr);
+    setSessionId(sid);
+    activeSessionIdRef.current = sid;
+    const sessionKeyPollToken = ++sessionKeyPollTokenRef.current;
+    setSessionKeySecret(null);
+    setSessionKeyPublic(null);
+
+    const s = createSynchronizedSession({ sessionId: sid, mode: 'two-player', dispatcher: dispatcherAddr, assassin: assassinAddr });
+    const armedSession = commitLocation(s, assassinAddr);
+    setSession({ ...armedSession, log: [] });
+    setLastPingResult(null);
+    const chad = { x: s.chad_x ?? 5, y: s.chad_y ?? 5 };
+    const secretSeed = deriveTwoPlayerSeed(sid, dispatcherAddr, assassinAddr, 'secret');
+    setSecret(encryption.encrypt(createSecret(secretSeed, chad)));
+
+    devModeSessionRef.current = false;
+    verifierBypassModeRef.current = false;
+    proofTurnRef.current = null;
+    setOnchainSessionHealthy(true);
+    onchainSessionHealthyRef.current = true;
+    onchainBootstrapPendingRef.current = false;
+    setOnchainBootstrapPending(false);
+    setChainLog([
+      { ts: Date.now(), level: 'INFO', msg: `CHAIN TERMINAL ONLINE (${chainCtx.network}) [ASSASSIN MODE]` },
+      { ts: Date.now(), level: 'INFO', msg: `SESSION=${sid} DISPATCHER=${dispatcherAddr.slice(0, 10)}...` },
+    ]);
+
+    setUiPhase('cutscene');
+
+    const wantsSingleConfirm = ENABLE_SESSION_KEY_MODE && wallet.walletType === 'wallet' && user !== 'GUEST';
+    if (wantsSingleConfirm && user === assassinAddr) {
+      void (async () => {
+        const getSigner = props.getContractSigner;
+        if (!getSigner) return;
+
+        const stillCurrentSession = () =>
+          activeSessionIdRef.current === sid && sessionKeyPollTokenRef.current === sessionKeyPollToken;
+
+        const authBackend = new ChainBackend(
+          { rpcUrl: appConfig.rpcUrl, networkPassphrase: appConfig.networkPassphrase, contractId: appConfig.proofOfLifeId },
+          getSigner(),
+          user
+        );
+
+        try {
+          let sessionVisible = false;
+          for (let i = 0; i < SESSION_KEY_VISIBILITY_POLL_ATTEMPTS; i++) {
+            if (!stillCurrentSession()) return;
+            try {
+              const sCheck = await authBackend.getSession(sid);
+              if (typeof sCheck.sessionId === 'number') {
+                sessionVisible = true;
+                break;
+              }
+            } catch {
+              // Dispatcher may still be waiting on testnet settlement.
+            }
+            if (i < SESSION_KEY_VISIBILITY_POLL_ATTEMPTS - 1) await sleep(SESSION_KEY_POLL_INTERVAL_MS);
+          }
+
+          if (!stillCurrentSession()) return;
+          if (!sessionVisible) {
+            setChainLog((l) =>
+              appendChainLog(l, {
+                ts: Date.now(),
+                level: 'WARN',
+                msg: `SESSION KEY authorize skipped for assassin (session not visible yet) session=${sid}; wallet-per-tx mode will continue`,
+              })
+            );
+            return;
+          }
+
+          const sessionKey = Keypair.random();
+          if (appConfig.networkPassphrase.includes('Test')) {
+            await fundSessionKeyOnTestnet(sessionKey.publicKey());
+          }
+          if (!stillCurrentSession()) return;
+
+          const assassinAllowMask =
+            SESSION_ALLOW_COMMIT_LOCATION |
+            SESSION_ALLOW_SUBMIT_PING_PROOF |
+            SESSION_ALLOW_SUBMIT_MOVE_PROOF |
+            SESSION_ALLOW_SUBMIT_TURN_STATUS_PROOF |
+            SESSION_ALLOW_ASSASSIN_TICK;
+
+          const r = await authBackend.authorizeSessionKey({
+            owner: assassinAddr,
+            sessionId: sid,
+            delegate: sessionKey.publicKey(),
+            ttlLedgers: Math.max(1, SESSION_KEY_TTL_LEDGERS),
+            maxWrites: Math.max(1, SESSION_KEY_MAX_WRITES),
+            dispatcherAllowMask: 0,
+            assassinAllowMask,
+          });
+
+          if (!stillCurrentSession()) return;
+          setSessionKeySecret(sessionKey.secret());
+          setSessionKeyPublic(sessionKey.publicKey());
+          setChainLog((l) =>
+            appendChainLog(l, {
+              ts: Date.now(),
+              level: 'INFO',
+              msg: `TX ${r.txHash ?? 'UNKNOWN'} ok authorize_session_key delegate=${sessionKey.publicKey().slice(0, 8)}... [ASSASSIN] one-confirm mode enabled`,
+            })
+          );
+        } catch (e) {
+          if (!stillCurrentSession()) return;
+          const h = tryExtractTxHashFromError(e);
+          setChainLog((l) =>
+            appendChainLog(l, {
+              ts: Date.now(),
+              level: 'WARN',
+              msg: `assassin authorize_session_key failed${h ? ` (hash=${h})` : ''}; wallet-per-tx mode will continue: ${String(e)}`,
+            })
+          );
+        }
+      })();
+    }
+  };
+
+  const clearAssassinPath = () => {
+    setAssassinPlannedPath([]);
+    setAssassinTurnError(null);
+  };
+
+  const undoAssassinPathStep = () => {
+    setAssassinPlannedPath((cur) => (cur.length ? cur.slice(0, -1) : cur));
+    setAssassinTurnError(null);
+  };
+
+  const handleAssassinMapTileClick = (coord: Coord) => {
+    if (!assassinTurnPrepared) return;
+    if (assassinTurnBusy || assassinSubmitBusyRef.current) return;
+    if (controlsLocked) return;
+
+    const last = assassinPlannedPath.length ? assassinPlannedPath[assassinPlannedPath.length - 1] : null;
+    const anchor = last ?? assassinTurnPrepared.from;
+    if (anchor.x === coord.x && anchor.y === coord.y) {
+      if (assassinPlannedPath.length) undoAssassinPathStep();
+      return;
+    }
+
+    const backtrackTarget = assassinPlannedPath.length >= 2
+      ? assassinPlannedPath[assassinPlannedPath.length - 2]!
+      : assassinTurnPrepared.from;
+    if (assassinPlannedPath.length >= 1 && backtrackTarget.x === coord.x && backtrackTarget.y === coord.y) {
+      undoAssassinPathStep();
+      return;
+    }
+
+    const nextPath = [...assassinPlannedPath, { x: coord.x, y: coord.y }];
+    const validation = validateManualAssassinPath(assassinTurnPrepared, nextPath, DEFAULT_SIM_CONFIG);
+    if (!validation.ok) {
+      setAssassinTurnError(validation.reason ?? 'Invalid assassin path');
+      return;
+    }
+    setAssassinTurnError(null);
+    setAssassinPlannedPath(nextPath);
+  };
+
+  const afterChadCommandTwoPlayerDispatcher = (queued: SessionState) => {
+    if (commandLockRef.current || chainPipelineLockRef.current || onchainMutationLockRef.current || onchainBootstrapPendingRef.current) return;
+    commandLockRef.current = true;
+    setCommandLocked(true);
+    setSession(queued);
+
+    if (queued.ended) {
+      commandLockRef.current = false;
+      setCommandLocked(false);
+      return;
+    }
+
+    // Local/SIM fallback keeps legacy auto-resolution behavior (two-player manual control targets on-chain mode).
+    if (!onchainGameplayEnabled || !chainBackend) {
+      if (secret) {
+        const out = stepAfterDispatcherActionWithTrace(queued, encryption.decrypt(secret), DEFAULT_SIM_CONFIG);
+        setSecret(encryption.encrypt(out.secret));
+        setSession(out.session);
+      }
+      commandLockRef.current = false;
+      setCommandLocked(false);
+      releasePipelineLocks();
+      return;
+    }
+
+    const cmd = queued.pending_chad_cmd ?? 'STAY';
+    const ping = pendingPing;
+    chainPipelineLockRef.current = true;
+    setChainPipelineLocked(true);
+    clearPipelineFailsafe();
+    pipelineFailsafeRef.current = window.setTimeout(() => {
+      if (chainPipelineLockRef.current || onchainMutationLockRef.current) {
+        setChainLog((l2) =>
+          appendChainLog(l2, {
+            ts: Date.now(),
+            level: 'WARN',
+            msg: 'Pipeline watchdog: releasing stuck action locks after timeout.',
+          })
+        );
+        releasePipelineLocks();
+        commandLockRef.current = false;
+        setCommandLocked(false);
+      }
+    }, PIPELINE_WATCHDOG_MS);
+
+    onchainMutationLockRef.current = true;
+    setOnchainMutationLocked(true);
+
+    void (async () => {
+      try {
+        if (!ping) {
+          setChainLog((l) =>
+            appendChainLog(l, {
+              ts: Date.now(),
+              level: 'INFO',
+              msg: `TX PENDING invoke recharge_with_command cmd=${cmd} (+battery, no ping)`,
+            })
+          );
+          const r = await (chainBackend as any).rechargeWithCommand({
+            sessionId: queued.sessionId >>> 0,
+            dispatcher,
+            command: cmd,
+          });
+          setChainLog((l) =>
+            appendChainLog(l, {
+              ts: Date.now(),
+              level: 'INFO',
+              msg: `TX ${r.txHash ?? 'UNKNOWN'} ok recharge_with_command cmd=${cmd} session=${queued.sessionId >>> 0} turn=${queued.turn >>> 0}`,
+            })
+          );
+        } else {
+          const towerId = ping.tower === 'N' ? 0 : ping.tower === 'E' ? 1 : ping.tower === 'S' ? 2 : 3;
+          setChainLog((l) =>
+            appendChainLog(l, {
+              ts: Date.now(),
+              level: 'INFO',
+              msg: `TX PENDING invoke dispatch tower=${ping.tower} cmd=${cmd}`,
+            })
+          );
+          const r = await chainBackend.dispatch({ sessionId: queued.sessionId, dispatcher, towerId, command: cmd });
+          setChainLog((l) =>
+            appendChainLog(l, {
+              ts: Date.now(),
+              level: 'INFO',
+              msg: `TX ${r.txHash ?? 'UNKNOWN'} ok dispatch tower=${ping.tower} cmd=${cmd} session=${queued.sessionId} turn=${queued.turn}`,
+            })
+          );
+        }
+
+        let onchainNow: SessionState | null = null;
+        for (let poll = 0; poll < 12; poll++) {
+          try {
+            const sPoll = await chainBackend.getSession(queued.sessionId);
+            onchainNow = sPoll;
+            if (sPoll.phase === 'assassin') break;
+          } catch {
+            // retry
+          }
+          if (poll < 11) await sleep(700);
+        }
+        if (onchainNow) {
+          setSession((cur) => (cur && cur.mode === 'two-player'
+            ? mergeOnchainStateIntoTwoPlayerLocal(cur, { ...onchainNow!, mode: 'two-player', dispatcher: cur.dispatcher, assassin: cur.assassin })
+            : cur));
+        }
+        setChainLog((l) =>
+          appendChainLog(l, {
+            ts: Date.now(),
+            level: 'INFO',
+            msg: `DISPATCHER TURN COMPLETE — waiting for assassin turn (${queued.sessionId}:${queued.turn})`,
+          })
+        );
+      } catch (e) {
+        const h = tryExtractTxHashFromError(e);
+        if (isSessionKeyAuthContractError(e)) {
+          setSessionKeySecret(null);
+          setSessionKeyPublic(null);
+          setChainLog((l2) =>
+            appendChainLog(l2, {
+              ts: Date.now(),
+              level: 'WARN',
+              msg: 'ONCHAIN: session-key authorization failed during dispatcher command. One-confirm mode disabled for this run.',
+            })
+          );
+        } else if (isTxMalformedError(e)) {
+          setSessionKeySecret(null);
+          setSessionKeyPublic(null);
+          setChainLog((l2) =>
+            appendChainLog(l2, {
+              ts: Date.now(),
+              level: 'WARN',
+              msg: 'ONCHAIN: dispatcher command transaction was malformed (txMalformed). One-confirm mode disabled for this run.',
+            })
+          );
+        } else if (isDesyncError(e)) {
+          markOnchainDesynced('dispatcher command mismatch');
+        }
+        setChainLog((l) =>
+          appendChainLog(l, {
+            ts: Date.now(),
+            level: 'ERROR',
+            msg: `dispatcher command failed${h ? ` (hash=${h})` : ''}: ${String(e)}`,
+          })
+        );
+      } finally {
+        onchainMutationLockRef.current = false;
+        setOnchainMutationLocked(false);
+        commandLockRef.current = false;
+        setCommandLocked(false);
+        pingProofRef.current = null;
+        proofTurnRef.current = null;
+        releasePipelineLocks();
+      }
+    })();
+  };
+
+  const submitAssassinTurn = async () => {
+    if (!session || !chainBackend || !chainBackend) return;
+    if (!assassinTurnPrepared || !secretState) return;
+    if (!assassinPathValidation?.ok) {
+      setAssassinTurnError(assassinPathValidation?.reason ?? 'Invalid assassin path');
+      return;
+    }
+    if (assassinSubmitBusyRef.current || assassinTurnBusy) return;
+    if (user !== assassin) {
+      setAssassinTurnError('Assassin wallet required');
+      setChainLog((l) =>
+        appendChainLog(l, {
+          ts: Date.now(),
+          level: 'ERROR',
+          msg: `ROLE MISMATCH: ASSASSIN TURN requires assassin wallet (${assassin.slice(0, 8)}...)`,
+        })
+      );
+      return;
+    }
+
+    let out: { session: SessionState; secret: SecretState; trace: { path: Coord[]; from: Coord; to: Coord } };
+    try {
+      out = applyManualAssassinPath(assassinTurnPrepared, assassinPlannedPath, DEFAULT_SIM_CONFIG);
+    } catch (e) {
+      setAssassinTurnError(String(e));
+      return;
+    }
+
+    assassinSubmitBusyRef.current = true;
+    setAssassinTurnBusy(true);
+    setAssassinTurnError(null);
+
+    chainPipelineLockRef.current = true;
+    setChainPipelineLocked(true);
+    onchainMutationLockRef.current = true;
+    setOnchainMutationLocked(true);
+
+    const sessionId0 = session.sessionId >>> 0;
+    const path = out.trace.path;
+    const from = out.trace.from;
+    const s0 = assassinTurnPrepared.secret;
+    const hadPing = typeof session.pending_ping_tower === 'number';
+    const pendingTowerIdx = typeof session.pending_ping_tower === 'number' ? (session.pending_ping_tower >>> 0) : null;
+
+    const maybeRunAssassinTickFallback = async (reason: 'recharge path' | 'dev fallback' | 'verifier bypass' | 'ping proof unavailable', d2Chad = 0): Promise<void> => {
+      const pre = await chainBackend.getSession(sessionId0);
+      if (pre.phase !== 'assassin') {
+        setChainLog((l) =>
+          appendChainLog(l, {
+            ts: Date.now(),
+            level: 'WARN',
+            msg: `assassin_tick skipped (${reason}) because on-chain phase=${pre.phase}`,
+          })
+        );
+        return;
+      }
+      const rTick = await chainBackend.assassinTick({
+        sessionId: sessionId0,
+        assassin,
+        d2Chad,
+      });
+      setChainLog((l) =>
+        appendChainLog(l, {
+          ts: Date.now(),
+          level: 'INFO',
+          msg: `TX ${rTick.txHash ?? 'UNKNOWN'} ok assassin_tick (${reason}) session=${sessionId0}`,
+        })
+      );
+    };
+
+    try {
+      setChainLog((l) =>
+        appendChainLog(l, {
+          ts: Date.now(),
+          level: 'INFO',
+          msg: `ASSASSIN TURN READY path_steps=${path.length} turn=${session.turn >>> 0} session=${sessionId0}`,
+        })
+      );
+
+      const onchainStart = await chainBackend.getSession(sessionId0);
+      if (onchainStart.phase !== 'assassin') {
+        throw new Error(`on-chain phase is ${onchainStart.phase}; expected assassin`);
+      }
+      const turn0 = onchainStart.turn >>> 0;
+      let pingProofConfirmed = false;
+
+      if (hadPing && pendingTowerIdx !== null) {
+        const towerIdLabel: TowerId = pendingTowerIdx === 0 ? 'N' : pendingTowerIdx === 1 ? 'E' : pendingTowerIdx === 2 ? 'S' : 'W';
+        let towers = chainTowers;
+        if (!towers) {
+          try {
+            towers = await chainBackend.getTowers();
+            setChainTowers(towers as any);
+          } catch {
+            towers = CONTRACT_DEFAULT_TOWERS;
+          }
+        }
+        const towerXY = towerXYFor(towerIdLabel, towers);
+        const dx = s0.assassin.x - towerXY.x;
+        const dy = s0.assassin.y - towerXY.y;
+        const d2Local = (dx * dx) + (dy * dy);
+
+        if (devModeSessionRef.current) {
+          setChainLog((l) =>
+            appendChainLog(l, {
+              ts: Date.now(),
+              level: 'WARN',
+              msg: `DEV MODE: skipping submit_ping_proof session=${sessionId0} turn=${turn0}`,
+            })
+          );
+        } else if (verifierBypassModeRef.current) {
+          setChainLog((l) =>
+            appendChainLog(l, {
+              ts: Date.now(),
+              level: 'WARN',
+              msg: `ONCHAIN: verifier bypass active; skipping submit_ping_proof session=${sessionId0} turn=${turn0}`,
+            })
+          );
+        } else if (!zkVerifiersReady || !onchainSessionHealthyRef.current) {
+          setChainLog((l) =>
+            appendChainLog(l, {
+              ts: Date.now(),
+              level: 'WARN',
+              msg: `ONCHAIN: submit_ping_proof skipped (verifiers/session unavailable) session=${sessionId0} turn=${turn0}`,
+            }, 240)
+          );
+        } else {
+          const pingProof = await prover.pingDistance({
+            x: s0.assassin.x,
+            y: s0.assassin.y,
+            salt: s0.salt,
+            tower_x: towerXY.x,
+            tower_y: towerXY.y,
+            session_id: sessionId0,
+            turn: turn0,
+          });
+          if (pingProof.d2 !== d2Local) {
+            setChainLog((l) =>
+              appendChainLog(l, {
+                ts: Date.now(),
+                level: 'WARN',
+                msg: `PING MISMATCH local_d2=${d2Local} prover_d2=${pingProof.d2} (tower=${towerIdLabel})`,
+              })
+            );
+          }
+          setChainLog((l) => appendChainLog(l, { ts: Date.now(), level: 'INFO', msg: `ZK ping_distance proof generated [${pingProof.publicInputs.length} public inputs]` }));
+          const rPing = await chainBackend.submitPingProof({
+            sessionId: sessionId0,
+            assassin,
+            towerId: pendingTowerIdx,
+            d2: pingProof.d2,
+            proof: pingProof.proof,
+            publicInputs: pingProof.publicInputs,
+          });
+          setChainLog((l) =>
+            appendChainLog(l, {
+              ts: Date.now(),
+              level: 'INFO',
+              msg: `TX ${rPing.txHash ?? 'UNKNOWN'} ok submit_ping_proof d2=${pingProof.d2} session=${sessionId0} turn=${turn0}`,
+            })
+          );
+          pingProofConfirmed = true;
+          setLastPingResult({ tower: towerIdLabel, d2: pingProof.d2, at: Date.now(), turn: turn0 });
+        }
+      }
+
+      const shouldSkipMoveProofs = devModeSessionRef.current || verifierBypassModeRef.current;
+      if (path.length > 0 && !shouldSkipMoveProofs) {
+        const moveProofInputs = path.map((step, i) => ({
+          x_old: i === 0 ? from.x : path[i - 1].x,
+          y_old: i === 0 ? from.y : path[i - 1].y,
+          salt_old: s0.salt,
+          x_new: step.x,
+          y_new: step.y,
+          salt_new: s0.salt,
+          session_id: sessionId0,
+          turn: turn0,
+        }));
+        const moveProofs = await Promise.all(moveProofInputs.map((inp) => prover.moveProof(inp)));
+        setChainLog((l) =>
+          appendChainLog(l, {
+            ts: Date.now(),
+            level: 'INFO',
+            msg: `ZK ${moveProofs.length} move_proofs generated${hadPing ? ' (ping path)' : ' (recharge path)'}`,
+          })
+        );
+        if ('submitMultiMoveProof' in chainBackend && moveProofs.length > 0) {
+          const rMv = await (chainBackend as any).submitMultiMoveProof({
+            sessionId: sessionId0,
+            assassin,
+            entries: moveProofs.map((mv: any) => ({
+              newCommitment: mv.commitmentNew,
+              proof: mv.proof,
+              publicInputs: mv.publicInputs,
+            })),
+          });
+          setChainLog((l) =>
+            appendChainLog(l, {
+              ts: Date.now(),
+              level: 'INFO',
+              msg: `TX ${rMv.txHash ?? 'UNKNOWN'} ok submit_multi_move_proof (${moveProofs.length} steps)`,
+            })
+          );
+        } else {
+          for (const mv of moveProofs as any[]) {
+            const rMv = await chainBackend.submitMoveProof({
+              sessionId: sessionId0,
+              assassin,
+              newCommitment: mv.commitmentNew,
+              proof: mv.proof,
+              publicInputs: mv.publicInputs,
+            });
+            setChainLog((l) =>
+              appendChainLog(l, {
+                ts: Date.now(),
+                level: 'INFO',
+                msg: `TX ${rMv.txHash ?? 'UNKNOWN'} ok submit_move_proof [ZK-verified step, coordinates sealed]`,
+              })
+            );
+          }
+        }
+      } else if (path.length > 0 && shouldSkipMoveProofs) {
+        const reason = devModeSessionRef.current ? 'dev mode' : 'verifier bypass';
+        setChainLog((l) =>
+          appendChainLog(l, {
+            ts: Date.now(),
+            level: 'WARN',
+            msg: `ONCHAIN: skipping move proofs (${reason}) session=${sessionId0} turn=${turn0}`,
+          })
+        );
+      }
+
+      if (hadPing && pingProofConfirmed && !shouldSkipMoveProofs) {
+        let cx = out.session.chad_x ?? 0;
+        let cy = out.session.chad_y ?? 0;
+        try {
+          const onchainSession = await chainBackend.getSession(sessionId0);
+          if (typeof onchainSession.chad_x === 'number' && typeof onchainSession.chad_y === 'number') {
+            cx = onchainSession.chad_x;
+            cy = onchainSession.chad_y;
+          }
+        } catch {
+          // fall back to local prepared sim output
+        }
+        const finalPos = path.length > 0 ? path[path.length - 1] : from;
+        const st = await prover.turnStatus({
+          x: finalPos.x,
+          y: finalPos.y,
+          salt: s0.salt,
+          cx,
+          cy,
+          session_id: sessionId0,
+          turn: turn0,
+        });
+        setChainLog((l) =>
+          appendChainLog(l, {
+            ts: Date.now(),
+            level: 'INFO',
+            msg: `ZK turn_status proof generated bytes=${st.proof.length} public_inputs=${st.publicInputs.length}`,
+          })
+        );
+        const rSt = await chainBackend.submitTurnStatusProof({
+          sessionId: sessionId0,
+          assassin,
+          d2Chad: st.d2Chad,
+          proof: st.proof,
+          publicInputs: st.publicInputs,
+        });
+        setChainLog((l) =>
+          appendChainLog(l, {
+            ts: Date.now(),
+            level: 'INFO',
+            msg: `TX ${rSt.txHash ?? 'UNKNOWN'} ok submit_turn_status_proof d2_chad=${st.d2Chad} advance_turn`,
+          })
+        );
+      } else {
+        const reason = !hadPing
+          ? 'recharge path'
+          : devModeSessionRef.current
+            ? 'dev fallback'
+            : verifierBypassModeRef.current
+              ? 'verifier bypass'
+              : 'ping proof unavailable';
+        await maybeRunAssassinTickFallback(reason);
+      }
+
+      setSecret(encryption.encrypt(out.secret));
+      setSession(out.session);
+      setAssassinPlannedPath([]);
+      setAssassinTurnError(null);
+      if (typeof BroadcastChannel !== 'undefined') {
+        try {
+          const bc = new BroadcastChannel('pol-game-sync');
+          const msg: GameSyncMessage = {
+            type: 'assassin-turn-applied',
+            sessionId: sessionId0,
+            completedTurn: turn0,
+            secret: out.secret,
+          };
+          bc.postMessage(msg);
+          bc.close();
+        } catch {
+          // Same-origin tab sync is best-effort; chain polling remains the fallback.
+        }
+      }
+      setChainLog((l) =>
+        appendChainLog(l, {
+          ts: Date.now(),
+          level: 'INFO',
+          msg: `ASSASSIN TURN SUBMITTED path_steps=${path.length} session=${sessionId0} turn=${turn0}`,
+        })
+      );
+    } catch (e) {
+      const h = tryExtractTxHashFromError(e);
+      if (isSessionKeyAuthContractError(e)) {
+        setSessionKeySecret(null);
+        setSessionKeyPublic(null);
+        setChainLog((l2) =>
+          appendChainLog(l2, {
+            ts: Date.now(),
+            level: 'WARN',
+            msg: 'ONCHAIN: assassin session-key authorization failed during submit. One-confirm mode disabled for this run.',
+          })
+        );
+      } else if (isTxMalformedError(e)) {
+        setSessionKeySecret(null);
+        setSessionKeyPublic(null);
+        setChainLog((l2) =>
+          appendChainLog(l2, {
+            ts: Date.now(),
+            level: 'WARN',
+            msg: 'ONCHAIN: assassin transaction was malformed (txMalformed). One-confirm mode disabled for this run.',
+          })
+        );
+      } else if (isContractCode(e, 22)) {
+        try {
+          const sChk = await chainBackend.getSession(sessionId0);
+          if (sChk.insecure_mode && !verifierBypassModeRef.current) {
+            verifierBypassModeRef.current = true;
+            setChainLog((l2) =>
+              appendChainLog(l2, {
+                ts: Date.now(),
+                level: 'WARN',
+                msg: 'ONCHAIN: verifier rejected assassin proof (#22 InvalidProof). insecure_mode=true, enabling verifier bypass.',
+              })
+            );
+          }
+        } catch {
+          // best-effort
+        }
+      } else if (isDesyncError(e)) {
+        markOnchainDesynced('assassin turn proof mismatch');
+      }
+      setAssassinTurnError(String(e));
+      setChainLog((l) =>
+        appendChainLog(l, {
+          ts: Date.now(),
+          level: 'ERROR',
+          msg: `assassin turn failed${h ? ` (hash=${h})` : ''}: ${formatProofErrorForChainLog(e)}`,
+        })
+      );
+    } finally {
+      assassinSubmitBusyRef.current = false;
+      setAssassinTurnBusy(false);
+      chainPipelineLockRef.current = false;
+      setChainPipelineLocked(false);
+      onchainMutationLockRef.current = false;
+      setOnchainMutationLocked(false);
+    }
+  };
+
   const doPing = (tower: TowerId) => {
     if (!session) return;
     if (!canPing) return;
@@ -2036,6 +3136,8 @@ export function ProofOfLifeGame(props: {
         <IntroScreen
           onStart={start}
           onShowRules={() => setShowRules(true)}
+          onCreateLobby={() => setUiPhase('lobby')}
+          onJoinLobby={() => setUiPhase('lobby')}
           wallet={wallet}
           userAddress={user}
           mode={mode}
@@ -2044,6 +3146,19 @@ export function ProofOfLifeGame(props: {
           setAssassinAddress={setAssassinAddress}
           devMode={devMode}
           setDevMode={setDevMode}
+        />
+      );
+    }
+
+    if (visibleUiPhase === 'lobby') {
+      return (
+        <LobbyScreen
+          userAddress={user}
+          networkPassphrase={appConfig.networkPassphrase}
+          contractId={appConfig.proofOfLifeId || ''}
+          chainBackend={chainBackend}
+          onLobbyComplete={handleLobbyComplete}
+          onBack={() => setUiPhase('setup')}
         />
       );
     }
@@ -2098,12 +3213,13 @@ export function ProofOfLifeGame(props: {
                 </>
               ) : null}
               <div className="pol-boardTopbarSep" />
-              <div className="pol-boardMeta">
-                  <div>SESSION: <span className="text-white">{session.sessionId}</span></div>
-                  <div>TURN: <span className="text-amber-300">{session.turn}</span></div>
-                  <div>NETWORK: <span className="text-cyan-400">{chainCtx.network}</span></div>
-                  <div>STATUS: <span className={statusClass}>{statusLabel}</span></div>
-              </div>
+	              <div className="pol-boardMeta">
+	                  <div>SESSION: <span className="text-white">{session.sessionId}</span></div>
+	                  <div>TURN: <span className="text-amber-300">{session.turn}</span></div>
+	                  <div>NETWORK: <span className="text-cyan-400">{chainCtx.network}</span></div>
+	                  <div>ROLE: <span className={playerRole === 'dispatcher' ? 'text-cyan-300' : playerRole === 'assassin' ? 'text-red-300' : 'text-white/70'}>{playerRole.toUpperCase()}</span></div>
+	                  <div>STATUS: <span className={statusClass}>{statusLabel}</span></div>
+	              </div>
            </div>
         </div>
 
@@ -2117,6 +3233,13 @@ export function ProofOfLifeGame(props: {
                 <RetroMap
                   session={session}
                   secret={secret}
+                  showChadMarker={shouldShowChadMarkerOnMap}
+                  showAssassinMarker={session.mode !== 'two-player' || assassinClientByRole}
+                  assassinPath={session.mode === 'two-player' && assassinClientByRole ? assassinPlannedPath : undefined}
+                  assassinPathStart={session.mode === 'two-player' && assassinClientByRole && assassinTurnPrepared ? assassinTurnPrepared.from : null}
+                  onTileClick={session.mode === 'two-player' && assassinClientByRole && assassinTurnPrepared && uiPhase === 'play'
+                    ? (coord) => handleAssassinMapTileClick(coord as Coord)
+                    : undefined}
                   towers={TOWERS.map(t => {
                     const coords = towerXYFor(t.id, chainTowers);
                     return { ...t, x: coords.x, y: coords.y };
@@ -2169,23 +3292,87 @@ export function ProofOfLifeGame(props: {
                  )}
                </CRTPanel>
 
-                 <CRTPanel title="COMMAND OVERRIDE" className="pol-boardPanel flex-1 min-h-0 flex flex-col">
-                    <div className="grid grid-cols-2 gap-2 overflow-y-auto p-1 custom-scrollbar">
-                        {chadCmdOptions.map((opt) => (
-                          <button
-                            key={opt.cmd}
-                            onClick={() => doChadCommand(opt.cmd)}
-                            disabled={disableChadCmds}
-                            className={[
-                              'pol-boardCmdBtn',
-                              session?.pending_chad_cmd === opt.cmd ? 'is-active' : '',
-                            ].join(" ")}
-                          >
-                            {opt.label}
-                          </button>
-                        ))}
-                    </div>
-               </CRTPanel>
+	                 <CRTPanel
+	                   title={session.mode === 'two-player' && isAssassinClient ? 'ASSASSIN CONSOLE' : 'COMMAND OVERRIDE'}
+	                   className="pol-boardPanel flex-1 min-h-0 flex flex-col"
+	                 >
+	                   {session.mode === 'two-player' && isAssassinClient ? (
+	                     <div className="space-y-2 p-2 text-[11px] tracking-wide text-white/80">
+	                       <div className="flex items-center justify-between">
+	                         <span className="text-red-300 font-semibold">KILLER CONTROL</span>
+	                         <span className="text-white/50">{session.phase === 'assassin' ? 'ACTIVE' : 'WAIT'}</span>
+	                       </div>
+	                       <div className="grid grid-cols-2 gap-2 text-[10px]">
+	                         <div className="rounded border border-white/10 px-2 py-1">
+	                           <div className="text-white/45">MAX STEPS</div>
+	                           <div className="text-red-300">{assassinTurnPrepared?.maxSteps ?? '-'}</div>
+	                         </div>
+	                         <div className="rounded border border-white/10 px-2 py-1">
+	                           <div className="text-white/45">USED</div>
+	                           <div className="text-red-300">{assassinPlannedPath.length}</div>
+	                         </div>
+	                       </div>
+	                       {assassinTurnPrepared ? (
+	                         <>
+	                           <div className="text-white/55">
+	                             Click adjacent tiles on the map to build the killer path, then submit the assassin turn.
+	                           </div>
+	                           <div className={[
+	                             'rounded border px-2 py-2 text-[10px]',
+	                             assassinPathValidation?.ok ? 'border-emerald-400/30 text-emerald-200' : 'border-amber-300/30 text-amber-200',
+	                           ].join(' ')}>
+	                             {assassinPathValidation?.ok
+	                               ? `PATH READY (${assassinPlannedPath.length}/${assassinTurnPrepared.maxSteps})`
+	                               : (assassinTurnError || assassinPathValidation?.reason || 'Build a valid path to continue')}
+	                           </div>
+	                           <div className="grid grid-cols-3 gap-2">
+	                             <button
+	                               onClick={clearAssassinPath}
+	                               disabled={assassinTurnBusy || assassinPlannedPath.length === 0}
+	                               className="pol-boardTopbarBtn pol-boardTopbarBtn--ghost text-[10px]"
+	                             >
+	                               CLEAR
+	                             </button>
+	                             <button
+	                               onClick={undoAssassinPathStep}
+	                               disabled={assassinTurnBusy || assassinPlannedPath.length === 0}
+	                               className="pol-boardTopbarBtn pol-boardTopbarBtn--ghost text-[10px]"
+	                             >
+	                               UNDO
+	                             </button>
+	                             <button
+	                               onClick={() => { void submitAssassinTurn(); }}
+	                               disabled={!assassinTurnCanSubmit}
+	                               className="pol-boardTopbarBtn pol-boardTopbarBtn--cyan text-[10px]"
+	                             >
+	                               {assassinTurnBusy ? 'SUBMITTING' : 'SUBMIT'}
+	                             </button>
+	                           </div>
+	                         </>
+	                       ) : (
+	                         <div className="text-white/55">
+	                           Waiting for dispatcher action to hand over the assassin turn.
+	                         </div>
+	                       )}
+	                     </div>
+	                   ) : (
+	                     <div className="grid grid-cols-2 gap-2 overflow-y-auto p-1 custom-scrollbar">
+	                       {chadCmdOptions.map((opt) => (
+	                         <button
+	                           key={opt.cmd}
+	                           onClick={() => doChadCommand(opt.cmd)}
+	                           disabled={disableChadCmds || !isDispatcherClient}
+	                           className={[
+	                             'pol-boardCmdBtn',
+	                             session?.pending_chad_cmd === opt.cmd ? 'is-active' : '',
+	                           ].join(" ")}
+	                         >
+	                           {opt.label}
+	                         </button>
+	                       ))}
+	                     </div>
+	                   )}
+	               </CRTPanel>
             </div>
 
             {/* OVERLAY: Top Right (Meters) */}
@@ -2201,26 +3388,72 @@ export function ProofOfLifeGame(props: {
                       accent="emerald"
                       compact={true}
                     />
-                    <button onClick={doRecharge} disabled={!canRecharge || controlsLocked} className="pol-boardRechargeBtn">
-                      RECHARGE GENERATOR
-                    </button>
-                  </div>
-                </CRTPanel>
+	                    {session.mode === 'two-player' && isAssassinClient ? (
+	                      <div className="text-[11px] tracking-wide text-white/55 border border-white/10 rounded px-2 py-2">
+	                        Dispatcher-only control panel hidden on assassin client.
+	                      </div>
+	                    ) : (
+	                      <button onClick={doRecharge} disabled={!canRecharge || controlsLocked || !isDispatcherClient} className="pol-boardRechargeBtn">
+	                        RECHARGE GENERATOR
+	                      </button>
+	                    )}
+	                  </div>
+	                </CRTPanel>
 
-               <CRTPanel title="TRIANG. UPLINK" rightTag="PINGS" className="pol-boardPanel flex-1 min-h-0 flex flex-col">
-                  <div className="grid grid-cols-2 gap-2 overflow-y-auto p-1 custom-scrollbar">
-                      {TOWERS.map((t) => (
-                        <button
-                          key={t.id}
-                          onClick={() => doPing(t.id)}
-                          className="pol-boardPingBtn"
-                          disabled={!canPing || controlsLocked}
-                        >
-                          PING {t.label}
-                        </button>
-                      ))}
-                  </div>
-               </CRTPanel>
+	               <CRTPanel
+	                 title={session.mode === 'two-player' && isAssassinClient ? 'ASSASSIN STATUS' : 'TRIANG. UPLINK'}
+	                 rightTag={session.mode === 'two-player' && isAssassinClient ? 'ROLE' : 'PINGS'}
+	                 className="pol-boardPanel flex-1 min-h-0 flex flex-col"
+	               >
+	                  {session.mode === 'two-player' && isAssassinClient ? (
+	                    <div className="space-y-2 p-2 text-[11px] tracking-wide text-white/80">
+	                      <div className="flex items-center justify-between">
+	                        <span className="text-white/50">DISPATCHER</span>
+	                        <span className="text-cyan-300">{dispatcher.slice(0, 8)}...</span>
+	                      </div>
+	                      <div className="flex items-center justify-between">
+	                        <span className="text-white/50">ASSASSIN</span>
+	                        <span className="text-red-300">{assassin.slice(0, 8)}...</span>
+	                      </div>
+	                      <div className="flex items-center justify-between">
+	                        <span className="text-white/50">PHASE</span>
+	                        <span className={session.phase === 'assassin' ? 'text-red-300' : 'text-cyan-300'}>{session.phase.toUpperCase()}</span>
+	                      </div>
+	                      <div className="flex items-center justify-between">
+	                        <span className="text-white/50">PENDING PING</span>
+	                        <span className="text-white/80">
+	                          {typeof session.pending_ping_tower === 'number'
+	                            ? (session.pending_ping_tower === 0 ? 'N' : session.pending_ping_tower === 1 ? 'E' : session.pending_ping_tower === 2 ? 'S' : 'W')
+	                            : 'NONE'}
+	                        </span>
+	                      </div>
+	                      <div className="flex items-center justify-between">
+	                        <span className="text-white/50">PATH</span>
+	                        <span className={assassinPathValidation?.ok ? 'text-emerald-300' : 'text-amber-200'}>
+	                          {assassinTurnPrepared ? `${assassinPlannedPath.length}/${assassinTurnPrepared.maxSteps}` : '--'}
+	                        </span>
+	                      </div>
+	                      <div className="pt-1 text-white/55">
+	                        {assassinTurnPrepared
+	                          ? 'Build a killer path on the map and submit the assassin turn.'
+	                          : 'Waiting for dispatcher actions. Use COMMS LOGS to follow chain activity.'}
+	                      </div>
+	                    </div>
+	                  ) : (
+	                    <div className="grid grid-cols-2 gap-2 overflow-y-auto p-1 custom-scrollbar">
+	                      {TOWERS.map((t) => (
+	                        <button
+	                          key={t.id}
+	                          onClick={() => doPing(t.id)}
+	                          className="pol-boardPingBtn"
+	                          disabled={!canPing || controlsLocked || !isDispatcherClient}
+	                        >
+	                          PING {t.label}
+	                        </button>
+	                      ))}
+	                    </div>
+	                  )}
+	               </CRTPanel>
             </div>
         </div>
         <div className="pol-boardSubtitleBelow" aria-live="polite">

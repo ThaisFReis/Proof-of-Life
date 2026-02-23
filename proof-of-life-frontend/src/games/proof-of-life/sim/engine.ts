@@ -45,6 +45,24 @@ export type AssassinMoveTrace = {
   to: Coord;
 };
 
+export type AssassinTurnPrepared = {
+  session: SessionState;
+  secret: SecretState;
+  from: Coord;
+  target: Coord;
+  chad: Coord;
+  chadHidden: boolean;
+  maxSteps: number;
+  mustMove: boolean;
+};
+
+export type AssassinPathValidation = {
+  ok: boolean;
+  reason?: string;
+  maxSteps: number;
+  mustMove: boolean;
+};
+
 export const DEFAULT_SIM_CONFIG: SimConfig = {
   gridW: 10,
   gridH: 10,
@@ -272,14 +290,14 @@ export function stepAfterDispatcherAction(
   return { session: out.session, secret: out.secret };
 }
 
-export function stepAfterDispatcherActionWithTrace(
+export function prepareAssassinTurnFromDispatcherAction(
   session: SessionState,
   secret: SecretState,
   cfg: SimConfig = DEFAULT_SIM_CONFIG
-): { session: SessionState; secret: SecretState; trace: AssassinMoveTrace } {
+): AssassinTurnPrepared | null {
   // Called after the dispatcher has taken an action (PING/RECHARGE) and selected a Chad command.
   if (session.ended || session.phase !== 'dispatcher' || session.turn_step !== 'command') {
-    return { session, secret, trace: { path: [], from: secret.assassin, to: secret.assassin } };
+    return null;
   }
 
   // Chad movement (player command), then assassin moves toward Chad (hidden).
@@ -316,6 +334,7 @@ export function stepAfterDispatcherActionWithTrace(
       pending_chad_cmd: 'STAY',
       chad_hidden: chadHidden,
       chad_hide_streak: hideStreak,
+      phase: 'assassin',
     },
     `YOU: ${renderOperatorGuidance(cmd)}`
   );
@@ -347,31 +366,116 @@ export function stepAfterDispatcherActionWithTrace(
     lastKnown = seen[Math.max(0, seen.length - 3)];
   }
 
-  const target = lastKnown;
-  const speed = chadHidden ? 6 : 1;
+  return {
+    session: next,
+    secret: { ...secret, last_known_chad: lastKnown, seen_chad: seen },
+    from: secret.assassin,
+    target: lastKnown,
+    chad: chad1,
+    chadHidden,
+    maxSteps: chadHidden ? 6 : 1,
+    mustMove: true,
+  };
+}
 
+export function prepareAssassinTurnFromAssassinPhase(
+  session: SessionState,
+  secret: SecretState,
+  cfg: SimConfig = DEFAULT_SIM_CONFIG
+): AssassinTurnPrepared | null {
+  if (session.ended || session.phase !== 'assassin') return null;
+  const chad: Coord = {
+    x: typeof session.chad_x === 'number' ? session.chad_x : cfg.chadDefault.x,
+    y: typeof session.chad_y === 'number' ? session.chad_y : cfg.chadDefault.y,
+  };
+  // Some on-chain builds can lag or misreport `chad_hidden`; infer hidden mode from the
+  // actual hide tile / streak so assassin controls still get the correct 6-step movement.
+  const chadHidden = !!session.chad_hidden || !!(session.chad_hide_streak && session.chad_hide_streak > 0) || isHideTile(chad.x, chad.y);
+  let seen = secret.seen_chad;
+  let lastKnown = secret.last_known_chad;
+  if (!chadHidden) {
+    const lastSeen = seen[seen.length - 1];
+    if (!lastSeen || lastSeen.x !== chad.x || lastSeen.y !== chad.y) {
+      seen = [...seen, chad].slice(-12);
+      lastKnown = seen[Math.max(0, seen.length - 3)];
+    }
+  }
   const from = secret.assassin;
-  const path: Coord[] = [];
-  let assassinPos = from;
-  for (let i = 0; i < speed; i++) {
-    const step = nextStepToward(assassinPos, target, cfg.gridW, cfg.gridH);
-    if (step.x === assassinPos.x && step.y === assassinPos.y) break;
-    assassinPos = step;
-    path.push(assassinPos);
+  const target = lastKnown;
+  const maxSteps = chadHidden ? 6 : 1;
+  const forced = pickAnyAssassinMove(from, target, cfg.gridW, cfg.gridH);
+  const mustMove = forced.x !== from.x || forced.y !== from.y;
+  return {
+    session,
+    secret: { ...secret, last_known_chad: lastKnown, seen_chad: seen },
+    from,
+    target,
+    chad,
+    chadHidden,
+    maxSteps,
+    mustMove,
+  };
+}
+
+export function validateManualAssassinPath(
+  prepared: AssassinTurnPrepared,
+  path: readonly Coord[],
+  cfg: SimConfig = DEFAULT_SIM_CONFIG
+): AssassinPathValidation {
+  const maxSteps = prepared.maxSteps;
+  const mustMove = prepared.mustMove;
+  if (path.length > maxSteps) {
+    return { ok: false, reason: `path exceeds max steps (${path.length}/${maxSteps})`, maxSteps, mustMove };
   }
-  // Assassin cannot stand still: if no movement happened, force a patrol step.
-  if (assassinPos.x === secret.assassin.x && assassinPos.y === secret.assassin.y) {
-    assassinPos = pickAnyAssassinMove(assassinPos, target, cfg.gridW, cfg.gridH);
-    if (assassinPos.x !== secret.assassin.x || assassinPos.y !== secret.assassin.y) path.push(assassinPos);
+  if (mustMove && path.length === 0) {
+    return { ok: false, reason: 'assassin must move at least one step', maxSteps, mustMove };
   }
 
-  const moved = clampToGrid(assassinPos, cfg.gridW, cfg.gridH);
-  // Ensure trace "to" matches the clamped coordinate.
+  let cur = prepared.from;
+  for (let i = 0; i < path.length; i++) {
+    const step = path[i]!;
+    if (!Number.isFinite(step.x) || !Number.isFinite(step.y)) {
+      return { ok: false, reason: `invalid coordinate at step ${i + 1}`, maxSteps, mustMove };
+    }
+    if (step.x < 0 || step.y < 0 || step.x >= cfg.gridW || step.y >= cfg.gridH) {
+      return { ok: false, reason: `out-of-bounds step at ${step.x},${step.y}`, maxSteps, mustMove };
+    }
+    const manhattan = Math.abs(step.x - cur.x) + Math.abs(step.y - cur.y);
+    if (manhattan !== 1) {
+      return { ok: false, reason: `step ${i + 1} must be adjacent`, maxSteps, mustMove };
+    }
+    if (!canMove4(cur.x, cur.y, step.x, step.y) || !isAssassinPassable(step.x, step.y)) {
+      return { ok: false, reason: `step ${i + 1} is blocked`, maxSteps, mustMove };
+    }
+    cur = step;
+  }
+
+  return { ok: true, maxSteps, mustMove };
+}
+
+export function applyManualAssassinPath(
+  prepared: AssassinTurnPrepared,
+  pathIn: readonly Coord[],
+  cfg: SimConfig = DEFAULT_SIM_CONFIG
+): { session: SessionState; secret: SecretState; trace: AssassinMoveTrace } {
+  const validation = validateManualAssassinPath(prepared, pathIn, cfg);
+  if (!validation.ok) {
+    throw new Error(validation.reason ?? 'invalid assassin path');
+  }
+
+  const path = pathIn.map((p) => ({ x: p.x, y: p.y }));
+  const from = prepared.from;
+  let moved = path.length ? path[path.length - 1]! : from;
+  moved = clampToGrid(moved, cfg.gridW, cfg.gridH);
   if (path.length) {
-    const last = path[path.length - 1];
+    const last = path[path.length - 1]!;
     if (last.x !== moved.x || last.y !== moved.y) path[path.length - 1] = moved;
   }
-  const nextSecret: SecretState = { ...secret, assassin: moved, last_known_chad: lastKnown, seen_chad: seen };
+
+  const nextSecret: SecretState = { ...prepared.secret, assassin: moved };
+  let next = prepared.session;
+  const chad1 = prepared.chad;
+  const chadHidden = prepared.chadHidden;
 
   // Status update (d2 to Chad), used to drive alpha and kill.
   const distToChad = d2(moved, chad1);
@@ -429,6 +533,36 @@ export function stepAfterDispatcherActionWithTrace(
     next = append({ ...next, ended: true, outcome: 'win_extraction' }, 'EXTRACTION COMPLETE: CHAD IS SAFE');
   }
   return { session: next, secret: nextSecret, trace: { path, from, to: moved } };
+}
+
+function buildAutoAssassinPath(prepared: AssassinTurnPrepared, cfg: SimConfig): Coord[] {
+  const path: Coord[] = [];
+  let assassinPos = prepared.from;
+  for (let i = 0; i < prepared.maxSteps; i++) {
+    const step = nextStepToward(assassinPos, prepared.target, cfg.gridW, cfg.gridH);
+    if (step.x === assassinPos.x && step.y === assassinPos.y) break;
+    assassinPos = step;
+    path.push(assassinPos);
+  }
+  // Assassin cannot stand still: if no movement happened, force a patrol step.
+  if (prepared.mustMove && path.length === 0) {
+    const forced = pickAnyAssassinMove(assassinPos, prepared.target, cfg.gridW, cfg.gridH);
+    if (forced.x !== prepared.from.x || forced.y !== prepared.from.y) path.push(forced);
+  }
+  return path;
+}
+
+export function stepAfterDispatcherActionWithTrace(
+  session: SessionState,
+  secret: SecretState,
+  cfg: SimConfig = DEFAULT_SIM_CONFIG
+): { session: SessionState; secret: SecretState; trace: AssassinMoveTrace } {
+  const prepared = prepareAssassinTurnFromDispatcherAction(session, secret, cfg);
+  if (!prepared) {
+    return { session, secret, trace: { path: [], from: secret.assassin, to: secret.assassin } };
+  }
+  const autoPath = buildAutoAssassinPath(prepared, cfg);
+  return applyManualAssassinPath(prepared, autoPath, cfg);
 }
 
 function popOutOfHideTile(from: Coord, room: string, w: number, h: number): Coord | null {

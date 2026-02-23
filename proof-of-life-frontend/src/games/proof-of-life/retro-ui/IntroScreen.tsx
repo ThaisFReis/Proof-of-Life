@@ -5,6 +5,8 @@ import './IntroScreen.css';
 interface IntroProps {
   onStart: () => void;
   onShowRules: () => void;
+  onCreateLobby?: () => void;
+  onJoinLobby?: () => void;
   wallet: {
     isConnected: boolean;
     isConnecting: boolean;
@@ -32,7 +34,7 @@ export function IntroScreen(props: IntroProps) {
   const [showLogin, setShowLogin] = useState(false);
   const configLocked = !props.wallet.isConnected;
   const isRealWallet = props.wallet.walletType === 'wallet';
-  const launchDisabled = !props.wallet.isConnected || (props.mode === 'two-player' && !props.assassinAddress.trim());
+  const launchDisabled = !props.wallet.isConnected || props.mode === 'two-player';
 
   useEffect(() => {
     const interval = setInterval(() => setBlink((b) => !b), 800);
@@ -199,15 +201,29 @@ export function IntroScreen(props: IntroProps) {
 
             {props.mode === 'two-player' && (
               <div className="pol-setupStack pol-setupAnimateIn">
-                <label className="pol-setupLabel">Assassin Operator ID</label>
-                <input
-                  type="text"
-                  className="pol-setupInput"
-                  placeholder="G... (Stellar address)"
-                  value={props.assassinAddress}
-                  disabled={configLocked}
-                  onChange={(e) => props.setAssassinAddress(e.target.value)}
-                />
+                <p className="pol-setupLabel" style={{ marginBottom: '0.1rem' }}>Lobby Setup</p>
+                <div className="pol-lobbyChoose" style={{ gridTemplateColumns: '1fr 1fr', gap: '0.5rem' }}>
+                  <button
+                    className="pol-lobbyChooseBtn pol-lobbyChooseBtn--create"
+                    style={{ padding: '0.75rem 0.5rem' }}
+                    disabled={configLocked}
+                    onClick={props.onCreateLobby}
+                  >
+                    <span className="pol-lobbyChooseBtnIcon" style={{ fontSize: '1.1rem' }}>📡</span>
+                    <span className="pol-lobbyChooseBtnLabel">Create Lobby</span>
+                    <span className="pol-lobbyChooseBtnDesc">Dispatcher</span>
+                  </button>
+                  <button
+                    className="pol-lobbyChooseBtn pol-lobbyChooseBtn--join"
+                    style={{ padding: '0.75rem 0.5rem' }}
+                    disabled={configLocked}
+                    onClick={props.onJoinLobby}
+                  >
+                    <span className="pol-lobbyChooseBtnIcon" style={{ fontSize: '1.1rem' }}>🗡️</span>
+                    <span className="pol-lobbyChooseBtnLabel">Join Lobby</span>
+                    <span className="pol-lobbyChooseBtnDesc">Assassin</span>
+                  </button>
+                </div>
               </div>
             )}
 
@@ -217,16 +233,25 @@ export function IntroScreen(props: IntroProps) {
             </div>
 
             <div className="pol-setupActions">
-              <button
-                className="pol-setupBtn pol-setupBtn--launch"
-                onClick={props.onStart}
-                disabled={launchDisabled}
-              >
-                {props.mode === 'single' ? 'EXECUTE SOLO MISSION' : 'ESTABLISH DUAL SESSION'}
-              </button>
-              {!launchDisabled && isRealWallet && (
-                <div className="pol-setupTxHint">
-                  Next step: your wallet will open a confirmation modal for the on-chain transaction.
+              {props.mode === 'single' && (
+                <>
+                  <button
+                    className="pol-setupBtn pol-setupBtn--launch"
+                    onClick={props.onStart}
+                    disabled={launchDisabled}
+                  >
+                    EXECUTE SOLO MISSION
+                  </button>
+                  {!launchDisabled && isRealWallet && (
+                    <div className="pol-setupTxHint">
+                      Next step: your wallet will open a confirmation modal for the on-chain transaction.
+                    </div>
+                  )}
+                </>
+              )}
+              {props.mode === 'two-player' && (
+                <div className="pol-setupTxHint" style={{ textAlign: 'center' }}>
+                  Select CREATE LOBBY or JOIN LOBBY above to begin the two-player flow.
                 </div>
               )}
 

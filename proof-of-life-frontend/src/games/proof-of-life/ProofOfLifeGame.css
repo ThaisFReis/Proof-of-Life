@@ -929,6 +929,7 @@
 }
 
 .pol-cell {
+  position: relative;
   aspect-ratio: 1 / 1;
   border-radius: 6px;
   background: var(--cellFill, rgba(184, 255, 220, 0.06));
@@ -949,6 +950,65 @@
 
 .pol-cell--assassin {
   /* Keep class hook for logic/debug, but render no visual marker. */
+}
+
+.pol-cell--assassinVisible {
+  border-color: rgba(248, 113, 113, 0.75);
+  box-shadow:
+    inset 0 0 0 1px rgba(248, 113, 113, 0.35),
+    0 0 0 2px rgba(248, 113, 113, 0.18),
+    0 0 14px rgba(248, 113, 113, 0.2);
+  background:
+    radial-gradient(circle at 50% 50%, rgba(248, 113, 113, 0.28) 0%, rgba(248, 113, 113, 0.08) 45%, transparent 70%),
+    var(--cellFill, rgba(184, 255, 220, 0.06));
+}
+
+.pol-cell--path {
+  border-color: rgba(248, 113, 113, 0.82);
+  box-shadow:
+    inset 0 0 0 1px rgba(248, 113, 113, 0.45),
+    0 0 0 1px rgba(248, 113, 113, 0.2);
+  background:
+    linear-gradient(180deg, rgba(248, 113, 113, 0.15), rgba(248, 113, 113, 0.07)),
+    var(--cellFill, rgba(184, 255, 220, 0.06));
+}
+
+.pol-cell--pathStart {
+  border-color: rgba(34, 211, 238, 0.85);
+  box-shadow:
+    inset 0 0 0 1px rgba(34, 211, 238, 0.45),
+    0 0 0 1px rgba(34, 211, 238, 0.25),
+    0 0 10px rgba(34, 211, 238, 0.2);
+}
+
+.pol-cell--pathEnd {
+  border-color: rgba(239, 68, 68, 0.95);
+  box-shadow:
+    inset 0 0 0 1px rgba(239, 68, 68, 0.55),
+    0 0 0 2px rgba(239, 68, 68, 0.2),
+    0 0 14px rgba(239, 68, 68, 0.25);
+}
+
+.pol-cellPathStep {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  line-height: 1;
+  font-weight: 700;
+  color: rgba(255, 255, 255, 0.95);
+  text-shadow: 0 0 8px rgba(0, 0, 0, 0.65);
+  pointer-events: none;
+}
+
+.pol-cell--pathStart .pol-cellPathStep {
+  color: rgba(207, 250, 254, 0.98);
+}
+
+.pol-cell--pathEnd .pol-cellPathStep {
+  color: rgba(254, 226, 226, 0.98);
 }
 
 .pol-cell--hide {

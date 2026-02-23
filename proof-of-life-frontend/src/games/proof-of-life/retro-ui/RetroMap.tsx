@@ -8,8 +8,22 @@ export function RetroMap(props: {
   session: SessionState;
   secret: EncryptedSecret | null;
   towers: { id: TowerId; label: string; x: number; y: number }[];
+  showChadMarker?: boolean;
+  showAssassinMarker?: boolean;
+  assassinPath?: readonly { x: number; y: number }[];
+  assassinPathStart?: { x: number; y: number } | null;
+  onTileClick?: (coord: { x: number; y: number }) => void;
 }) {
   const { session, secret } = props;
+  const showChadMarker = props.showChadMarker ?? true;
+  const showAssassinMarker = props.showAssassinMarker ?? true;
+  const decryptedSecret = useMemo(() => (secret ? encryption.decrypt(secret) : null), [secret]);
+  const pathIndexByCoord = useMemo(() => {
+    const m = new Map<string, number>();
+    (props.assassinPath ?? []).forEach((p, idx) => m.set(`${p.x},${p.y}`, idx));
+    return m;
+  }, [props.assassinPath]);
+  const lastPath = props.assassinPath && props.assassinPath.length ? props.assassinPath[props.assassinPath.length - 1] : null;
   
   return (
     <div className="w-full h-full flex items-center justify-center p-2 relative">
@@ -50,12 +64,13 @@ export function RetroMap(props: {
           {Array.from({ length: 100 }).map((_, idx) => {
               const x = idx % 10;
               const y = Math.floor(idx / 10);
-              const isChad = x === (session.chad_x ?? 5) && y === (session.chad_y ?? 5);
-              let isAssassin = false;
-              if (secret) {
-                  const s0 = encryption.decrypt(secret);
-                  isAssassin = x === s0.assassin.x && y === s0.assassin.y;
-              }
+              const isChad = showChadMarker && x === (session.chad_x ?? 5) && y === (session.chad_y ?? 5);
+              const isAssassin = !!decryptedSecret && showAssassinMarker && x === decryptedSecret.assassin.x && y === decryptedSecret.assassin.y;
+              const isVisibleAssassinMarker = isAssassin && session.mode === 'two-player';
+              const pathIdx = pathIndexByCoord.get(`${x},${y}`);
+              const isPath = typeof pathIdx === 'number';
+              const isPathStart = !!props.assassinPathStart && x === props.assassinPathStart.x && y === props.assassinPathStart.y;
+              const isPathEnd = !!lastPath && x === lastPath.x && y === lastPath.y;
               const plan = getCellPlan(x, y);
               const meta = ROOM_LEGEND[plan.room];
               
@@ -72,10 +87,21 @@ export function RetroMap(props: {
                   key={idx}
                   className={`pol-cell ${isChad ? 'pol-cell--chad' : ''} ${isHideTile(x, y) ? 'pol-cell--hide' : ''} ${
                   isBlockedTile(x, y) ? 'pol-cell--blocked' : ''
-                  } ${isAssassin ? 'pol-cell--assassin' : ''}`}
+                  } ${isAssassin ? 'pol-cell--assassin' : ''} ${isVisibleAssassinMarker ? 'pol-cell--assassinVisible' : ''} ${
+                    isPath ? 'pol-cell--path' : ''
+                  } ${isPathStart ? 'pol-cell--pathStart' : ''} ${isPathEnd ? 'pol-cell--pathEnd' : ''} ${
+                    props.onTileClick ? 'cursor-pointer' : ''
+                  }`}
                   style={style}
-                  title={`${x},${y} ${meta.label}${isChad ? ' (CHAD)' : ''}`}
-              />
+                  title={`${x},${y} ${meta.label}${isChad ? ' (CHAD)' : ''}${isPath ? ` [PATH ${Number(pathIdx) + 1}]` : ''}`}
+                  onClick={props.onTileClick ? () => props.onTileClick?.({ x, y }) : undefined}
+              >
+                {isPath ? (
+                  <span className="pol-cellPathStep" aria-hidden="true">
+                    {Number(pathIdx) + 1}
+                  </span>
+                ) : null}
+              </div>
               );
           })}
 
