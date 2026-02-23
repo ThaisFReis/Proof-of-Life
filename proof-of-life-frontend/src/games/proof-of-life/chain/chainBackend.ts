@@ -14,7 +14,7 @@ import { signAndSendViaLaunchtube } from '@/utils/transactionHelper';
 import { TxQueue } from './txQueue';
 import { Keypair, TransactionBuilder } from '@stellar/stellar-sdk';
 
-import { Client as ProofOfLifeClient, type Session as ChainSession } from '@/bindings/proof_of_life';
+import { Client as ProofOfLifeClient, Role as ChainRole, type Session as ChainSession } from '@/bindings/proof_of_life';
 
 // Bindings are generated from the deployed contract spec. When the contract evolves,
 // the repo may temporarily compile against older bindings until `bun run bindings proof-of-life`
@@ -312,7 +312,7 @@ export class ChainBackend implements Backend {
   }
 
   async getSessionKeyScope(params: { owner: string; sessionId: number; role: SessionRole }): Promise<SessionKeyScopeView | null> {
-    const roleArg = { tag: params.role, values: undefined };
+    const roleArg = params.role === 'Dispatcher' ? ChainRole.Dispatcher : ChainRole.Assassin;
     const tx = await (this.client as any).get_session_key_scope({
       owner: params.owner,
       session_id: params.sessionId >>> 0,
@@ -426,6 +426,32 @@ export class ChainBackend implements Backend {
     return { success: true, txHash: res.txHash };
   }
 
+  async rechargeWithCommand(params: {
+    sessionId: number;
+    dispatcher: string;
+    command: ChadCommand;
+  }): Promise<BackendResult> {
+    const actor = this.actorPublicKey || params.dispatcher;
+    const command = this.mapChadCommand(params.command);
+    const fn = (this.client as any).recharge_with_command;
+    if (typeof fn === 'function') {
+      const res = await this.write(() =>
+        fn.call(this.client, {
+          session_id: params.sessionId >>> 0,
+          dispatcher: actor,
+          command,
+        })
+      );
+      return { success: true, txHash: res.txHash };
+    }
+
+    if (params.command !== 'STAY') {
+      throw new Error('recharge_with_command is not available on the deployed contract; recharge + command sync is unsupported');
+    }
+
+    return this.recharge({ sessionId: params.sessionId, dispatcher: params.dispatcher });
+  }
+
   async commitLocation(params: {
     sessionId: number;
     assassin: string;
@@ -501,14 +527,37 @@ export class ChainBackend implements Backend {
     }));
     const submitFn = (this.client as any).submit_multi_move_proof;
     if (typeof submitFn === 'function') {
-      const res = await this.write(() =>
-        submitFn.call(this.client, {
-          session_id: params.sessionId >>> 0,
-          assassin: actor,
-          entries: entriesVec,
-        })
-      );
-      return { success: true, txHash: res.txHash };
+      try {
+        const res = await this.write(() =>
+          submitFn.call(this.client, {
+            session_id: params.sessionId >>> 0,
+            assassin: actor,
+            entries: entriesVec,
+          })
+        );
+        return { success: true, txHash: res.txHash };
+      } catch (err) {
+        // UltraHonk verifier + multiple move proofs can exceed Soroban sim budget on long HIDE paths.
+        // Split and retry recursively so the UI can continue without forcing a contract change.
+        if (params.entries.length > 1 && isOversizedMultiMoveBatchError(err)) {
+          const mid = Math.ceil(params.entries.length / 2);
+          let lastHash = 'UNKNOWN';
+          const left = await this.submitMultiMoveProof({
+            sessionId: params.sessionId,
+            assassin: params.assassin,
+            entries: params.entries.slice(0, mid),
+          });
+          lastHash = left.txHash ?? lastHash;
+          const right = await this.submitMultiMoveProof({
+            sessionId: params.sessionId,
+            assassin: params.assassin,
+            entries: params.entries.slice(mid),
+          });
+          lastHash = right.txHash ?? lastHash;
+          return { success: true, txHash: lastHash };
+        }
+        throw err;
+      }
     }
     // Fallback: submit one at a time if bindings don't have submit_multi_move_proof.
     let lastHash = 'UNKNOWN';
@@ -761,6 +810,23 @@ function isTxBadAuthError(err: unknown): boolean {
 function isSessionNotFoundContractError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err ?? '');
   return /Error\(Contract,\s*#1\)/i.test(msg);
+}
+
+function isBudgetExceededSimulationError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err ?? '');
+  return /Error\(Budget,\s*ExceededLimit\)/i.test(msg)
+    || /HostError:\s*Error\(Budget,\s*ExceededLimit\)/i.test(msg)
+    || (/ExceededLimit/i.test(msg) && /simulation failed/i.test(msg));
+}
+
+function isTxMalformedError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err ?? '');
+  return /txMalformed/i.test(msg)
+    || (/transaction to the network failed/i.test(msg) && /malformed/i.test(msg));
+}
+
+function isOversizedMultiMoveBatchError(err: unknown): boolean {
+  return isBudgetExceededSimulationError(err) || isTxMalformedError(err);
 }
 
 function isResourceLimitExceededError(err: unknown): boolean {

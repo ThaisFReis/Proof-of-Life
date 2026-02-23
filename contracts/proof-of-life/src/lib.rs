@@ -608,55 +608,7 @@ impl ProofOfLife {
         }
         s.battery -= PING_COST;
 
-        match command {
-            ChadCommand::Hide => {
-                if s.chad_hide_streak >= 2 {
-                    return Err(Error::InvalidHide);
-                }
-                s.chad_hidden = true;
-                s.chad_hide_streak += 1;
-            }
-            ChadCommand::Stay => {
-                s.chad_hide_streak = 0;
-                s.chad_hidden = false;
-            }
-            ChadCommand::WalkGarden(dir) => {
-                s.chad_hide_streak = 0;
-                s.chad_hidden = false;
-                match dir {
-                    0 => s.chad_y = s.chad_y.saturating_sub(1),
-                    1 => s.chad_x = s.chad_x.saturating_add(1),
-                    2 => s.chad_y = s.chad_y.saturating_add(1),
-                    3 => s.chad_x = s.chad_x.saturating_sub(1),
-                    _ => return Err(Error::InvalidMove),
-                }
-            }
-            ChadCommand::GoRoom(room_id) => {
-                s.chad_hide_streak = 0;
-                s.chad_hidden = false;
-                
-                let to_room = Self::room_code_from_id(room_id);
-                let from_room = floorplan::get_room_code(s.chad_x, s.chad_y);
-                
-                if let Some((nx, ny)) = Self::find_door(from_room, to_room) {
-                    s.chad_x = nx;
-                    s.chad_y = ny;
-                } else {
-                    // Fallback to a representative center tile if no direct door found (e.g. Garden spawns)
-                    // This matches frontend's findAnyExitToRoom or default entry logic.
-                    match to_room {
-                        b'G' => { s.chad_x = 5; s.chad_y = 1; }
-                        b'L' => { s.chad_x = 1; s.chad_y = 4; }
-                        b'S' => { s.chad_x = 8; s.chad_y = 4; }
-                        b'B' => { s.chad_x = 1; s.chad_y = 7; }
-                        b'D' => { s.chad_x = 8; s.chad_y = 6; }
-                        b'K' => { s.chad_x = 8; s.chad_y = 8; }
-                        b'E' => { s.chad_x = 4; s.chad_y = 8; }
-                        _ => { s.chad_x = 4; s.chad_y = 5; } // Hallway/Winter
-                    }
-                }
-            }
-        }
+        Self::apply_chad_command(&mut s, command)?;
 
         s.pending_ping_tower = Some(tower_id);
         s.phase = TurnPhase::Assassin;
@@ -991,16 +943,31 @@ impl ProofOfLife {
     }
 
     pub fn recharge(env: Env, session_id: u32, _dispatcher: Address) -> Result<(), Error> {
+        Self::recharge_with_command(env, session_id, _dispatcher, ChadCommand::Stay)
+    }
+
+    pub fn recharge_with_command(
+        env: Env,
+        session_id: u32,
+        dispatcher: Address,
+        command: ChadCommand,
+    ) -> Result<(), Error> {
         let (c, mut s) = Self::load_session_pair(&env, session_id)?;
         Self::require_owner_or_delegate(
             &env,
             session_id,
             &c.dispatcher,
-            &_dispatcher,
+            &dispatcher,
             Role::Dispatcher,
             SESSION_METHOD_RECHARGE,
         )?;
+        Self::ensure_not_ended(&s)?;
+        if s.phase != TurnPhase::Dispatcher {
+            return Err(Error::NotDispatcherTurn);
+        }
         s.battery = (s.battery + RECHARGE_AMOUNT).min(BATTERY_MAX);
+        Self::apply_chad_command(&mut s, command)?;
+        s.pending_ping_tower = None;
         s.phase = TurnPhase::Assassin;
         s.moved_this_turn = false;
         s.assassin_moves_this_turn = 0;
@@ -1191,6 +1158,60 @@ impl ProofOfLife {
     fn ensure_not_ended(s: &SessionRuntime) -> Result<(), Error> {
         if s.ended { Err(Error::GameAlreadyEnded) } else { Ok(()) }
     }
+
+    fn apply_chad_command(s: &mut SessionRuntime, command: ChadCommand) -> Result<(), Error> {
+        match command {
+            ChadCommand::Hide => {
+                if s.chad_hide_streak >= 2 {
+                    return Err(Error::InvalidHide);
+                }
+                s.chad_hidden = true;
+                s.chad_hide_streak += 1;
+            }
+            ChadCommand::Stay => {
+                s.chad_hide_streak = 0;
+                s.chad_hidden = false;
+            }
+            ChadCommand::WalkGarden(dir) => {
+                s.chad_hide_streak = 0;
+                s.chad_hidden = false;
+                match dir {
+                    0 => s.chad_y = s.chad_y.saturating_sub(1),
+                    1 => s.chad_x = s.chad_x.saturating_add(1),
+                    2 => s.chad_y = s.chad_y.saturating_add(1),
+                    3 => s.chad_x = s.chad_x.saturating_sub(1),
+                    _ => return Err(Error::InvalidMove),
+                }
+            }
+            ChadCommand::GoRoom(room_id) => {
+                s.chad_hide_streak = 0;
+                s.chad_hidden = false;
+
+                let to_room = Self::room_code_from_id(room_id);
+                let from_room = floorplan::get_room_code(s.chad_x, s.chad_y);
+
+                if let Some((nx, ny)) = Self::find_door(from_room, to_room) {
+                    s.chad_x = nx;
+                    s.chad_y = ny;
+                } else {
+                    // Fallback to a representative center tile if no direct door found (e.g. Garden spawns)
+                    // This matches frontend's findAnyExitToRoom or default entry logic.
+                    match to_room {
+                        b'G' => { s.chad_x = 5; s.chad_y = 1; }
+                        b'L' => { s.chad_x = 1; s.chad_y = 4; }
+                        b'S' => { s.chad_x = 8; s.chad_y = 4; }
+                        b'B' => { s.chad_x = 1; s.chad_y = 7; }
+                        b'D' => { s.chad_x = 8; s.chad_y = 6; }
+                        b'K' => { s.chad_x = 8; s.chad_y = 8; }
+                        b'E' => { s.chad_x = 4; s.chad_y = 8; }
+                        _ => { s.chad_x = 4; s.chad_y = 5; } // Hallway/Winter
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn verify_session_turn(pis: &Vec<BytesN<32>>, s_id: u32, turn: u32, s_idx: u32, t_idx: u32) -> Result<(), Error> {
         let pi_sid = pis.get(s_idx).ok_or(Error::ProofSessionMismatch)?;
         let pi_turn = pis.get(t_idx).ok_or(Error::ProofTurnMismatch)?;

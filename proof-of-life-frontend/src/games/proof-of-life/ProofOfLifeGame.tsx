@@ -61,8 +61,53 @@ const TOWERS: { id: TowerId; label: string }[] = [
 const ENABLE_SESSION_KEY_MODE = String((import.meta as any)?.env?.VITE_ENABLE_SESSION_KEY_MODE ?? 'true').toLowerCase() !== 'false';
 const SESSION_KEY_TTL_LEDGERS = Number((import.meta as any)?.env?.VITE_SESSION_KEY_TTL_LEDGERS ?? 360);
 const SESSION_KEY_MAX_WRITES = Number((import.meta as any)?.env?.VITE_SESSION_KEY_MAX_WRITES ?? 120);
+const SESSION_KEY_POLL_INTERVAL_MS = Number((import.meta as any)?.env?.VITE_SESSION_KEY_POLL_INTERVAL_MS ?? 1500);
+const SESSION_KEY_VISIBILITY_POLL_ATTEMPTS = Number((import.meta as any)?.env?.VITE_SESSION_KEY_VISIBILITY_POLL_ATTEMPTS ?? 20); // ~30s
+const SESSION_KEY_SCOPE_POLL_FOREGROUND_ATTEMPTS = Number((import.meta as any)?.env?.VITE_SESSION_KEY_SCOPE_POLL_FOREGROUND_ATTEMPTS ?? 10); // ~15s
+const SESSION_KEY_SCOPE_POLL_BACKGROUND_ATTEMPTS = Number((import.meta as any)?.env?.VITE_SESSION_KEY_SCOPE_POLL_BACKGROUND_ATTEMPTS ?? 60); // ~90s
 // Secure-mode proof generation + submission can exceed 30s on testnet; avoid premature lock release.
 const PIPELINE_WATCHDOG_MS = 120_000;
+const SUBTITLE_TURN_DURATION_MS = 27_000;
+
+function getSubtitleConversationLinesForSession(session: SessionState | null): string[] {
+  if (!session) return [];
+  const entries = (session.log ?? []).map((line, idx) => ({ line, idx }));
+  const dialogue = entries.filter((e) => e.line.startsWith('YOU:') || e.line.startsWith('CHAD:'));
+  if (!dialogue.length) return [];
+
+  let boundaryIdx = -1;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    if (/^TURN\s+\d+\s+READY$/.test(entries[i].line)) {
+      boundaryIdx = i;
+      break;
+    }
+  }
+
+  const afterBoundary = dialogue.filter((e) => e.idx > boundaryIdx);
+  const windowBase = afterBoundary.length > 0 ? afterBoundary : dialogue.slice(-8);
+  const youInWindow = windowBase.filter((e) => e.line.startsWith('YOU:'));
+
+  let scoped = windowBase;
+  if (youInWindow.length >= 2) {
+    const guidanceIdx = youInWindow[youInWindow.length - 2].idx;
+    scoped = windowBase.filter((e) => e.idx >= guidanceIdx);
+  } else if (youInWindow.length === 1) {
+    const startIdx = youInWindow[0].idx;
+    scoped = windowBase.filter((e) => e.idx >= startIdx);
+  }
+
+  const lines = scoped.length > 0 ? scoped : windowBase;
+  return lines.map((e) => e.line);
+}
+
+function subtitleLineHoldMsForCount(lineCount: number): number {
+  return Math.max(2200, Math.floor(SUBTITLE_TURN_DURATION_MS / Math.max(1, lineCount)));
+}
+
+function estimateSubtitlePlaybackMs(lines: readonly string[]): number {
+  if (!lines.length) return 0;
+  return subtitleLineHoldMsForCount(lines.length) * lines.length;
+}
 
 function createLocalKeypairSigner(secretKey: string, networkPassphrase: string): { publicKey: string; signer: ContractSigner } {
   const keypair = Keypair.fromSecret(secretKey);
@@ -154,7 +199,10 @@ export function ProofOfLifeGame(props: {
   const commandLockRef = useRef(false);
   const chainPipelineLockRef = useRef(false);
   const onchainMutationLockRef = useRef(false);
+  const activeSessionIdRef = useRef<number | null>(null);
+  const sessionKeyPollTokenRef = useRef(0);
   const pipelineFailsafeRef = useRef<number | null>(null);
+  const dialogueUnlockTimerRef = useRef<number | null>(null);
   const chainLogScrollRef = useRef<HTMLDivElement>(null);
   const phaseExitTimerRef = useRef<number | null>(null);
   const phaseEnterTimerRef = useRef<number | null>(null);
@@ -192,6 +240,7 @@ export function ProofOfLifeGame(props: {
     return () => {
       if (phaseExitTimerRef.current) window.clearTimeout(phaseExitTimerRef.current);
       if (phaseEnterTimerRef.current) window.clearTimeout(phaseEnterTimerRef.current);
+      if (dialogueUnlockTimerRef.current) window.clearTimeout(dialogueUnlockTimerRef.current);
     };
   }, []);
 
@@ -282,6 +331,12 @@ export function ProofOfLifeGame(props: {
 
   const power = useMemo(() => formatPowerMeter(session?.battery ?? 100), [session?.battery]);
   const controlsLocked = uiPhase !== 'play';
+  const firstSecureTurnRequiresPing =
+    !!session &&
+    onchainGameplayEnabled &&
+    !devModeSessionRef.current &&
+    !verifierBypassModeRef.current &&
+    session.turn === 0;
   const actionBusy = commandLocked || !!pendingPing || chainPipelineLocked || onchainMutationLocked || onchainBootstrapPending;
   const canPing =
     !!session &&
@@ -297,6 +352,7 @@ export function ProofOfLifeGame(props: {
     session.phase === 'dispatcher' &&
     session.turn_step === 'action' &&
     session.commitmentSet &&
+    !firstSecureTurnRequiresPing &&
     !actionBusy;
   const chadCmdOptions = useMemo(() => (session ? getAvailableChadCommands(session) : []), [session]);
   const disableChadCmds = shouldDisableChadCommands({ uiPhase, session, commandLocked, chainPipelineLocked });
@@ -341,36 +397,7 @@ export function ProofOfLifeGame(props: {
 
     return { strengthPct, band, toneClass };
   }, [lastPingResult]);
-  const subtitleConversationLines = useMemo(() => {
-    if (!session) return [] as string[];
-    const entries = (session.log ?? []).map((line, idx) => ({ line, idx }));
-    const dialogue = entries.filter((e) => e.line.startsWith('YOU:') || e.line.startsWith('CHAD:'));
-    if (!dialogue.length) return [] as string[];
-
-    let boundaryIdx = -1;
-    for (let i = entries.length - 1; i >= 0; i--) {
-      if (/^TURN\s+\d+\s+READY$/.test(entries[i].line)) {
-        boundaryIdx = i;
-        break;
-      }
-    }
-
-    const afterBoundary = dialogue.filter((e) => e.idx > boundaryIdx);
-    const windowBase = afterBoundary.length > 0 ? afterBoundary : dialogue.slice(-8);
-    const youInWindow = windowBase.filter((e) => e.line.startsWith('YOU:'));
-
-    let scoped = windowBase;
-    if (youInWindow.length >= 2) {
-      const guidanceIdx = youInWindow[youInWindow.length - 2].idx;
-      scoped = windowBase.filter((e) => e.idx >= guidanceIdx);
-    } else if (youInWindow.length === 1) {
-      const startIdx = youInWindow[0].idx;
-      scoped = windowBase.filter((e) => e.idx >= startIdx);
-    }
-
-    const lines = scoped.length > 0 ? scoped : windowBase;
-    return lines.map((e) => e.line);
-  }, [session]);
+  const subtitleConversationLines = useMemo(() => getSubtitleConversationLinesForSession(session), [session]);
   const activeSubtitle = useMemo(() => {
     const m = activeSubtitleLine.match(/^([A-Z]+):\s*(.*)$/);
     if (!m) return { speaker: null as string | null, text: activeSubtitleLine };
@@ -389,8 +416,7 @@ export function ProofOfLifeGame(props: {
       return;
     }
 
-    const turnDurationMs = 27000;
-    const subtitleLineHoldMs = Math.max(2200, Math.floor(turnDurationMs / subtitleConversationLines.length));
+    const subtitleLineHoldMs = subtitleLineHoldMsForCount(subtitleConversationLines.length);
     subtitleConversationLines.forEach((line, idx) => {
       const id = window.setTimeout(() => setActiveSubtitleLine(line), idx * subtitleLineHoldMs);
       subtitleTimersRef.current.push(id);
@@ -419,6 +445,12 @@ export function ProofOfLifeGame(props: {
   };
 
   const start = (forcedSessionId?: number) => {
+    if (dialogueUnlockTimerRef.current !== null) {
+      window.clearTimeout(dialogueUnlockTimerRef.current);
+      dialogueUnlockTimerRef.current = null;
+    }
+    commandLockRef.current = false;
+    setCommandLocked(false);
     // Cancel any scheduled script events from a previous run.
     while (timeouts.length) {
       const id = timeouts.pop();
@@ -426,6 +458,8 @@ export function ProofOfLifeGame(props: {
     }
 
     const sid = typeof forcedSessionId === 'number' ? forcedSessionId : sessionId;
+    const sessionKeyPollToken = ++sessionKeyPollTokenRef.current;
+    activeSessionIdRef.current = sid;
     setSessionKeySecret(null);
     setSessionKeyPublic(null);
     const s = createSession({
@@ -595,31 +629,60 @@ export function ProofOfLifeGame(props: {
             setUiPhase('cutscene');
             let dispatcherScopeReady = false;
             let assassinScopeReady = user !== assassin;
-            // Testnet txns need 20-30s to settle; poll 30×1500ms = 45s window.
-            for (let i = 0; i < 30; i++) {
-              try {
-                const dScope = await bootstrapBackend.getSessionKeyScope({
-                  owner: dispatcher,
-                  sessionId: sid,
-                  role: 'Dispatcher',
-                });
-                dispatcherScopeReady = !!dScope && dScope.delegate === sessionKey.publicKey();
-                if (user === assassin) {
-                  const aScope = await bootstrapBackend.getSessionKeyScope({
-                    owner: assassin,
-                    sessionId: sid,
-                    role: 'Assassin',
-                  });
-                  assassinScopeReady = !!aScope && aScope.delegate === sessionKey.publicKey();
+            const delegatePk = sessionKey.publicKey();
+            const stillCurrentSession = () =>
+              activeSessionIdRef.current === sid && sessionKeyPollTokenRef.current === sessionKeyPollToken;
+
+            const pollSessionVisible = async (attempts: number): Promise<boolean> => {
+              for (let i = 0; i < attempts; i++) {
+                if (!stillCurrentSession()) return false;
+                try {
+                  const sCheck = await bootstrapBackend.getSession(sid);
+                  if (typeof sCheck.sessionId === 'number') return true;
+                } catch (pollErr) {
+                  if (i === 0 || (i + 1) % 5 === 0) {
+                    console.warn(`[session-key] visibility poll ${i + 1}/${attempts} failed:`, pollErr);
+                  }
                 }
-                if (dispatcherScopeReady && assassinScopeReady) break;
-              } catch (pollErr) {
-                console.warn(`[session-key] poll ${i + 1}/30 failed:`, pollErr);
+                if (i < attempts - 1) await sleep(SESSION_KEY_POLL_INTERVAL_MS);
               }
-              if ((i + 1) % 5 === 0) {
-                console.info(`[session-key] poll ${i + 1}/30 — dispatcher=${dispatcherScopeReady} assassin=${assassinScopeReady}`);
+              return false;
+            };
+
+            const pollScopes = async (attempts: number, label: 'foreground' | 'background') => {
+              for (let i = 0; i < attempts; i++) {
+                if (!stillCurrentSession()) return;
+                try {
+                  const dScope = await bootstrapBackend.getSessionKeyScope({
+                    owner: dispatcher,
+                    sessionId: sid,
+                    role: 'Dispatcher',
+                  });
+                  dispatcherScopeReady = !!dScope && dScope.delegate === delegatePk;
+                  if (user === assassin) {
+                    const aScope = await bootstrapBackend.getSessionKeyScope({
+                      owner: assassin,
+                      sessionId: sid,
+                      role: 'Assassin',
+                    });
+                    assassinScopeReady = !!aScope && aScope.delegate === delegatePk;
+                  }
+                  if (dispatcherScopeReady && assassinScopeReady) return;
+                } catch (pollErr) {
+                  if (i === 0 || (i + 1) % 5 === 0) {
+                    console.warn(`[session-key] ${label} scope poll ${i + 1}/${attempts} failed:`, pollErr);
+                  }
+                }
+                if ((i + 1) % 10 === 0 || (label === 'foreground' && i + 1 === attempts)) {
+                  console.info(`[session-key] ${label} scope poll ${i + 1}/${attempts} — dispatcher=${dispatcherScopeReady} assassin=${assassinScopeReady}`);
+                }
+                if (i < attempts - 1) await sleep(SESSION_KEY_POLL_INTERVAL_MS);
               }
-              await sleep(1500);
+            };
+
+            const sessionVisible = await pollSessionVisible(SESSION_KEY_VISIBILITY_POLL_ATTEMPTS);
+            if (sessionVisible) {
+              await pollScopes(SESSION_KEY_SCOPE_POLL_FOREGROUND_ATTEMPTS, 'foreground');
             }
             if (dispatcherScopeReady && assassinScopeReady) {
               setSessionKeySecret(sessionKey.secret());
@@ -636,9 +699,43 @@ export function ProofOfLifeGame(props: {
                 appendChainLog(l2, {
                   ts: Date.now(),
                   level: 'WARN',
-                  msg: `SESSION KEY scope validation failed (dispatcher=${dispatcherScopeReady} assassin=${assassinScopeReady}) session=${sid}; continuing with wallet-per-tx mode`,
+                  msg: `SESSION KEY scope validation pending (dispatcher=${dispatcherScopeReady} assassin=${assassinScopeReady}) session=${sid}; continuing with wallet-per-tx mode for now`,
                 })
               );
+
+              // Keep polling in the background on slow testnet settlement and auto-enable
+              // one-confirm mode if the scopes appear later.
+              void (async () => {
+                try {
+                  if (!sessionVisible) {
+                    const visibleLater = await pollSessionVisible(SESSION_KEY_SCOPE_POLL_BACKGROUND_ATTEMPTS);
+                    if (!visibleLater || !stillCurrentSession()) return;
+                  }
+                  await pollScopes(SESSION_KEY_SCOPE_POLL_BACKGROUND_ATTEMPTS, 'background');
+                  if (!stillCurrentSession()) return;
+                  if (dispatcherScopeReady && assassinScopeReady) {
+                    setSessionKeySecret(sessionKey.secret());
+                    setSessionKeyPublic(delegatePk);
+                    setChainLog((l2) =>
+                      appendChainLog(l2, {
+                        ts: Date.now(),
+                        level: 'INFO',
+                        msg: `SESSION KEY scopes confirmed late (delegate=${delegatePk.slice(0, 8)}...) session=${sid}; one-confirm mode enabled`,
+                      })
+                    );
+                  } else {
+                    setChainLog((l2) =>
+                      appendChainLog(l2, {
+                        ts: Date.now(),
+                        level: 'WARN',
+                        msg: `SESSION KEY scope validation failed (dispatcher=${dispatcherScopeReady} assassin=${assassinScopeReady}) session=${sid}; wallet-per-tx mode will continue`,
+                      })
+                    );
+                  }
+                } catch (eBg) {
+                  console.warn('[session-key] background validation failed:', eBg);
+                }
+              })();
             }
           } else {
             const r = await bootstrapBackend.startGame({ sessionId: sid, dispatcher, assassin });
@@ -807,6 +904,10 @@ export function ProofOfLifeGame(props: {
   const restartSyncedSession = () => {
     const nextSessionId = createRandomSessionId();
     setSessionId(nextSessionId);
+    if (dialogueUnlockTimerRef.current !== null) {
+      window.clearTimeout(dialogueUnlockTimerRef.current);
+      dialogueUnlockTimerRef.current = null;
+    }
     commandLockRef.current = false;
     setCommandLocked(false);
     releasePipelineLocks();
@@ -881,22 +982,13 @@ export function ProofOfLifeGame(props: {
       setPendingPing(null);
       const seed = `recharge:${next.sessionId}:${next.turn}`;
       if (onchainGameplayEnabled) {
-        onchainMutationLockRef.current = true;
-        setOnchainMutationLocked(true);
-        setChainLog((l) => appendChainLog(l, { ts: Date.now(), level: 'INFO', msg: `TX PENDING invoke recharge +${next.rechargeAmount} contract=${chainCtx.contracts.game}` }));
-        void chainBackend
-          .recharge({ sessionId: next.sessionId, dispatcher })
-          .then((r) => {
-            setChainLog((cur) => appendChainLog(cur, { ts: Date.now(), level: 'INFO', msg: `TX ${r.txHash ?? 'UNKNOWN'} ok recharge session=${next.sessionId} turn=${next.turn}` }));
+        setChainLog((l) =>
+          appendChainLog(l, {
+            ts: Date.now(),
+            level: 'INFO',
+            msg: `TX ${chainBackend ? 'PENDING' : fakeTxHash(seed)} recharge +${next.rechargeAmount} (on-chain dispatch deferred until command)`,
           })
-          .catch((e) => {
-            const h = tryExtractTxHashFromError(e);
-            setChainLog((cur) => appendChainLog(cur, { ts: Date.now(), level: 'ERROR', msg: `recharge failed${h ? ` (hash=${h})` : ''}: ${String(e)}` }));
-          })
-          .finally(() => {
-            onchainMutationLockRef.current = false;
-            setOnchainMutationLocked(false);
-          });
+        );
       } else if (chainBackend) {
         setChainLog((l) =>
           appendChainLog(l, {
@@ -948,8 +1040,8 @@ export function ProofOfLifeGame(props: {
       const cmd = queued.pending_chad_cmd ?? 'STAY';
       const ping = pendingPing;
       hadPingForThisTurn = !!ping;
-      chainPipelineLockRef.current = !!ping;
-      setChainPipelineLocked(!!ping);
+      chainPipelineLockRef.current = true;
+      setChainPipelineLocked(true);
       clearPipelineFailsafe();
       pipelineFailsafeRef.current = window.setTimeout(() => {
         if (chainPipelineLockRef.current || onchainMutationLockRef.current) {
@@ -964,9 +1056,68 @@ export function ProofOfLifeGame(props: {
         }
       }, PIPELINE_WATCHDOG_MS);
       if (!ping) {
-        // No on-chain equivalent yet for "recharge then command" in the current contract interface.
-        // Keep gameplay responsive and simply avoid attempting an on-chain tx here.
-        pingProofRef.current = Promise.resolve(false);
+        setChainLog((l) =>
+          appendChainLog(l, {
+            ts: Date.now(),
+            level: 'INFO',
+            msg: `TX PENDING invoke recharge_with_command cmd=${cmd} (+battery, no ping)`,
+          })
+        );
+        onchainMutationLockRef.current = true;
+        setOnchainMutationLocked(true);
+        pingProofRef.current = (async () => {
+          try {
+            const r = await (chainBackend as any).rechargeWithCommand({
+              sessionId: queued.sessionId >>> 0,
+              dispatcher,
+              command: cmd,
+            });
+            setChainLog((l2) =>
+              appendChainLog(l2, {
+                ts: Date.now(),
+                level: 'INFO',
+                msg: `TX ${r.txHash ?? 'UNKNOWN'} ok recharge_with_command cmd=${cmd} session=${queued.sessionId >>> 0} turn=${queued.turn >>> 0}`,
+              })
+            );
+            return false;
+          } catch (e) {
+            const h = tryExtractTxHashFromError(e);
+            if (isSessionKeyAuthContractError(e)) {
+              setSessionKeySecret(null);
+              setSessionKeyPublic(null);
+              setChainLog((l2) =>
+                appendChainLog(l2, {
+                  ts: Date.now(),
+                  level: 'WARN',
+                  msg: 'ONCHAIN: session-key authorization failed (#28-#32) during recharge_with_command. One-confirm mode disabled for this run.',
+                })
+              );
+            } else if (isTxMalformedError(e)) {
+              setSessionKeySecret(null);
+              setSessionKeyPublic(null);
+              setChainLog((l2) =>
+                appendChainLog(l2, {
+                  ts: Date.now(),
+                  level: 'WARN',
+                  msg: 'ONCHAIN: recharge_with_command transaction was malformed (txMalformed). One-confirm mode disabled for this run.',
+                })
+              );
+            } else if (isDesyncError(e)) {
+              markOnchainDesynced('recharge_with_command mismatch');
+            }
+            setChainLog((l2) =>
+              appendChainLog(l2, {
+                ts: Date.now(),
+                level: 'ERROR',
+                msg: `recharge_with_command failed${h ? ` (hash=${h})` : ''}: ${String(e)}`,
+              })
+            );
+            throw e;
+          } finally {
+            onchainMutationLockRef.current = false;
+            setOnchainMutationLocked(false);
+          }
+        })();
       } else {
         onchainMutationLockRef.current = true;
         setOnchainMutationLocked(true);
@@ -1323,6 +1474,9 @@ export function ProofOfLifeGame(props: {
       }
 
       const out = stepAfterDispatcherActionWithTrace(queued, encryption.decrypt(secret), DEFAULT_SIM_CONFIG);
+      const rechargeDialogueLockMs = !hadPingForThisTurn
+        ? estimateSubtitlePlaybackMs(getSubtitleConversationLinesForSession(out.session))
+        : 0;
       const rollbackLocalStep = (reason: string) => {
         setSecret(secret);
         setSession(queued);
@@ -1341,8 +1495,20 @@ export function ProofOfLifeGame(props: {
         return;
       }
       setSecret(encryption.encrypt(out.secret));
-      commandLockRef.current = false;
-      setCommandLocked(false);
+      if (dialogueUnlockTimerRef.current !== null) {
+        window.clearTimeout(dialogueUnlockTimerRef.current);
+        dialogueUnlockTimerRef.current = null;
+      }
+      if (rechargeDialogueLockMs > 0) {
+        dialogueUnlockTimerRef.current = window.setTimeout(() => {
+          commandLockRef.current = false;
+          setCommandLocked(false);
+          dialogueUnlockTimerRef.current = null;
+        }, rechargeDialogueLockMs);
+      } else {
+        commandLockRef.current = false;
+        setCommandLocked(false);
+      }
       setSession(out.session);
       setChainLog((l) =>
         appendChainLog(l, {
