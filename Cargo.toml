@@ -6,6 +6,11 @@ members = [
   "contracts/twenty-one",
   "contracts/number-guess",
   "contracts/dice-duel",
+  "contracts/proof-of-life",
+  "contracts/zk-verifier",
+]
+exclude = [
+  "contracts/ultrahonk-verifier",
 ]
 
 [workspace.dependencies]

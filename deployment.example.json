@@ -1,0 +1,20 @@
+{
+  "timestamp": "2026-02-10T00:00:00.000Z",
+  "network": "testnet",
+  "contracts": {
+    "proofOfLife": "C...",
+    "gameHub": "C...",
+    "pingVerifier": "C...",
+    "turnStatusVerifier": "C...",
+    "moveVerifier": "C..."
+  },
+  "admin": "G...",
+  "rpcUrl": "https://soroban-testnet.stellar.org",
+  "networkPassphrase": "Test SDF Network ; September 2015",
+  "insecureMode": true,
+  "notes": [
+    "This is a template deployment configuration",
+    "Run 'bun run setup' to generate actual deployment",
+    "insecureMode should be set to false once Phase 3 verifiers are deployed"
+  ]
+}

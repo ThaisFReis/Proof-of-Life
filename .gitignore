@@ -3,6 +3,8 @@ test_snapshots/
 # Build artifacts
 target/
 *.wasm
+.zk-home/
+zk-artifacts/
 
 # Deployment info
 deployment.json
@@ -39,3 +41,9 @@ frontend-template/*.tsbuildinfo
 # OS
 .DS_Store
 Thumbs.db
+
+# Docs & Markdown
+*.md
+!README.md
+!readme.md
+docs/

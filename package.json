@@ -10,12 +10,21 @@
     "create": "bun run scripts/create.ts",
     "publish": "bun run scripts/publish.ts",
     "dev": "bun --cwd=sgs_frontend run dev",
-    "dev:game": "bun run scripts/dev-game.ts"
+    "dev:game": "bun run scripts/dev-game.ts",
+    "zk:install": "./scripts/install_noir.sh",
+    "zk:build": "bun run scripts/build_circuits.ts",
+    "zk:prover": "bun run scripts/prover_server.ts",
+    "zk:wire": "bun run scripts/zk_wire_verifiers.ts",
+    "zk:wire:auto": "bun run scripts/zk_wire_auto.ts",
+    "test": "bun test",
+    "floorplan:sync": "bun run scripts/export_floorplan.ts",
+    "demo": "bun run scripts/demo.ts"
   },
   "devDependencies": {
     "@types/bun": "latest"
   },
   "dependencies": {
+    "@noble/hashes": "^2.0.1",
     "@stellar/stellar-sdk": "^14.5.0"
   }
 }
