@@ -99,7 +99,8 @@ export const HIDE_TILES: Readonly<Record<RoomCode, readonly HideTile[]>> = {
   ],
   D: [
     { x: 9, y: 6, label: 'under the tablecloth' },
-    { x: 7, y: 5, label: 'inside a cabinet' },
+    // Keep hide tiles off door tiles (7,5 is the Dining <-> Hallway door).
+    { x: 8, y: 5, label: 'inside a cabinet' },
   ],
   E: [
     { x: 3, y: 9, label: 'inside the coat closet' },

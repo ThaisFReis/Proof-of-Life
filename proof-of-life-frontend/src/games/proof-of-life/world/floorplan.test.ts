@@ -88,6 +88,21 @@ describe('world/floorplan', () => {
     expect(count).toBeGreaterThan(0);
   });
 
+  test('hide tiles do not overlap open doorway tiles', () => {
+    const doorEndpoints = new Set<string>();
+    for (const d of DOORS_OPEN) {
+      doorEndpoints.add(`${d.ax},${d.ay}`);
+      doorEndpoints.add(`${d.bx},${d.by}`);
+    }
+
+    const codes = Object.keys(HIDE_TILES) as (keyof typeof HIDE_TILES)[];
+    for (const code of codes) {
+      for (const t of HIDE_TILES[code]) {
+        expect(doorEndpoints.has(`${t.x},${t.y}`)).toBe(false);
+      }
+    }
+  });
+
   test('hide tiles are only selectable when within manhattan distance', () => {
     const near = pickHideTileWithin('E', 3, 9, 0, 2);
     expect(near).not.toBeNull();

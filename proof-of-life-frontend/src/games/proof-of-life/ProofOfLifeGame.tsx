@@ -84,6 +84,9 @@ type GameSyncMessage =
       sessionId: number;
       completedTurn: number;
       secret: SecretState;
+      ended?: boolean;
+      outcome?: SessionState['outcome'];
+      lastLogLine?: string;
     };
 
 function fnv1a32(input: string): number {
@@ -100,15 +103,14 @@ function deriveTwoPlayerSeed(sessionId: number, dispatcherAddr: string, assassin
 }
 
 function deriveTwoPlayerChadCoord(sessionId: number, dispatcherAddr: string, assassinAddr: string): { x: number; y: number } {
-  const spawnable: { x: number; y: number }[] = [];
-  for (let y = 0; y < DEFAULT_SIM_CONFIG.gridH; y++) {
-    for (let x = 0; x < DEFAULT_SIM_CONFIG.gridW; x++) {
-      if (isChadSpawnable(x, y)) spawnable.push({ x, y });
-    }
-  }
-  if (!spawnable.length) return { ...DEFAULT_SIM_CONFIG.chadDefault };
-  const idx = deriveTwoPlayerSeed(sessionId, dispatcherAddr, assassinAddr, 'chad') % spawnable.length;
-  return spawnable[idx] ?? { ...DEFAULT_SIM_CONFIG.chadDefault };
+  // Must match contract `start_game` / `start_game_with_session_key` defaults.
+  // The contract currently initializes Chad at (4,7). If the frontend uses a different
+  // local spawn before the first on-chain sync, assassin/chad positions can appear unfair
+  // or immediately desync (including same-room starts).
+  void sessionId;
+  void dispatcherAddr;
+  void assassinAddr;
+  return { x: 4, y: 7 };
 }
 
 function createSynchronizedSession(params: {
@@ -344,6 +346,7 @@ export function ProofOfLifeGame(props: {
   const [uiPhase, setUiPhase] = useState<'setup' | 'lobby' | 'boot' | 'cutscene' | 'play'>('setup');
   const [visibleUiPhase, setVisibleUiPhase] = useState<'setup' | 'lobby' | 'boot' | 'cutscene' | 'play'>('setup');
   const [lobbyRole, setLobbyRole] = useState<'dispatcher' | 'assassin' | null>(null);
+  const [lobbyInitialRole, setLobbyInitialRole] = useState<'dispatcher' | 'assassin' | null>(null);
   const [phaseTransition, setPhaseTransition] = useState<'idle' | 'exiting' | 'entering'>('idle');
   const [hoverDrain, setHoverDrain] = useState<string | null>(null);
   const [recharging, setRecharging] = useState(false);
@@ -594,6 +597,20 @@ export function ProofOfLifeGame(props: {
       if ((cur.sessionId >>> 0) !== (msg.sessionId >>> 0)) return;
       if (isAssassinClient) return;
       setSecret(encryption.encrypt(msg.secret));
+      setSession((prev) => {
+        if (!prev || prev.mode !== 'two-player') return prev;
+        if ((prev.sessionId >>> 0) !== (msg.sessionId >>> 0)) return prev;
+        const nextLog =
+          msg.lastLogLine && prev.log[prev.log.length - 1] !== msg.lastLogLine
+            ? [...prev.log, msg.lastLogLine].slice(-200)
+            : prev.log;
+        return {
+          ...prev,
+          ended: typeof msg.ended === 'boolean' ? msg.ended : prev.ended,
+          outcome: msg.outcome ?? prev.outcome,
+          log: nextLog,
+        };
+      });
       setChainLog((l) =>
         appendChainLog(l, {
           ts: Date.now(),
@@ -1321,6 +1338,43 @@ export function ProofOfLifeGame(props: {
     setShowGameFinishedModal(false);
     finishedModalSessionRef.current = null;
     restartSyncedSession();
+  };
+
+  const handleBackToLobbyFromFinishedModal = () => {
+    setShowGameFinishedModal(false);
+    finishedModalSessionRef.current = null;
+    if (dialogueUnlockTimerRef.current !== null) {
+      window.clearTimeout(dialogueUnlockTimerRef.current);
+      dialogueUnlockTimerRef.current = null;
+    }
+    while (timeouts.length) {
+      const id = timeouts.pop();
+      if (typeof id === 'number') window.clearTimeout(id);
+    }
+    commandLockRef.current = false;
+    setCommandLocked(false);
+    releasePipelineLocks();
+    pingProofRef.current = null;
+    proofTurnRef.current = null;
+    verifierBypassModeRef.current = false;
+    activeSessionIdRef.current = null;
+    sessionKeyPollTokenRef.current += 1;
+    setSessionKeySecret(null);
+    setSessionKeyPublic(null);
+    setPendingPing(null);
+    setLastPingResult(null);
+    setAssassinPlannedPath([]);
+    setAssassinTurnBusy(false);
+    setAssassinTurnError(null);
+    assassinSubmitBusyRef.current = false;
+    setOnchainBootstrapPending(false);
+    onchainBootstrapPendingRef.current = false;
+    setOnchainSessionHealthy(true);
+    onchainSessionHealthyRef.current = true;
+    setLobbyRole(null);
+    setSession(null);
+    setSecret(null);
+    setUiPhase('lobby');
   };
 
   const arm = () => {
@@ -3007,6 +3061,9 @@ export function ProofOfLifeGame(props: {
             sessionId: sessionId0,
             completedTurn: turn0,
             secret: out.secret,
+            ended: out.session.ended,
+            outcome: out.session.outcome,
+            lastLogLine: out.session.log[out.session.log.length - 1],
           };
           bc.postMessage(msg);
           bc.close();
@@ -3165,8 +3222,14 @@ export function ProofOfLifeGame(props: {
         <IntroScreen
           onStart={start}
           onShowRules={() => setShowRules(true)}
-          onCreateLobby={() => setUiPhase('lobby')}
-          onJoinLobby={() => setUiPhase('lobby')}
+          onCreateLobby={() => {
+            setLobbyInitialRole('dispatcher');
+            setUiPhase('lobby');
+          }}
+          onJoinLobby={() => {
+            setLobbyInitialRole('assassin');
+            setUiPhase('lobby');
+          }}
           wallet={wallet}
           userAddress={user}
           mode={mode}
@@ -3186,8 +3249,12 @@ export function ProofOfLifeGame(props: {
           networkPassphrase={appConfig.networkPassphrase}
           contractId={appConfig.proofOfLifeId || ''}
           chainBackend={chainBackend}
+          initialRole={lobbyInitialRole}
           onLobbyComplete={handleLobbyComplete}
-          onBack={() => setUiPhase('setup')}
+          onBack={() => {
+            setLobbyInitialRole(null);
+            setUiPhase('setup');
+          }}
         />
       );
     }
@@ -3587,13 +3654,22 @@ export function ProofOfLifeGame(props: {
               </div>
             ) : null}
 
-            <div className="flex justify-end">
-              <button
-                onClick={handleCreateNewSessionFromFinishedModal}
-                className="px-4 py-2 rounded border border-cyan-400/30 bg-cyan-500/10 text-cyan-300 text-xs tracking-widest uppercase hover:bg-cyan-500/20"
-              >
-                Create New Session
-              </button>
+            <div className="flex justify-end gap-2">
+              {session.mode === 'two-player' ? (
+                <button
+                  onClick={handleBackToLobbyFromFinishedModal}
+                  className="px-4 py-2 rounded border border-amber-400/30 bg-amber-500/10 text-amber-300 text-xs tracking-widest uppercase hover:bg-amber-500/20"
+                >
+                  Back to Lobby
+                </button>
+              ) : (
+                <button
+                  onClick={handleCreateNewSessionFromFinishedModal}
+                  className="px-4 py-2 rounded border border-cyan-400/30 bg-cyan-500/10 text-cyan-300 text-xs tracking-widest uppercase hover:bg-cyan-500/20"
+                >
+                  Create New Session
+                </button>
+              )}
             </div>
           </div>
         ) : null}

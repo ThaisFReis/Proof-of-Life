@@ -27,6 +27,7 @@ interface LobbyScreenProps {
   networkPassphrase: string;
   contractId: string;
   chainBackend: ChainBackend | null;
+  initialRole?: 'dispatcher' | 'assassin' | null;
   onLobbyComplete: (params: { sessionId: number; dispatcher: string; assassin: string; role: 'dispatcher' | 'assassin' }) => void;
   onBack: () => void;
 }
@@ -284,6 +285,10 @@ function WaitingView(props: {
   const [lastError, setLastError] = useState<string | null>(null);
   const [source, setSource] = useState<'chain' | 'broadcast' | null>(null);
   const intervalRef = useRef<number | null>(null);
+  const isExpectedPendingSessionError = (e: unknown) => {
+    const s = String(e ?? '');
+    return /Error\s*\(\s*Contract\s*,\s*#1\s*\)/i.test(s) || /Transaction simulation failed/i.test(s);
+  };
 
   // Listen for dispatcher's BroadcastChannel signal (same-origin tab communication)
   useEffect(() => {
@@ -307,11 +312,17 @@ function WaitingView(props: {
         const s = await props.chainBackend!.getSession(props.sessionId);
         if (s && typeof s.sessionId === 'number') {
           setSource('chain');
+          setLastError(null);
           props.onSessionFound();
           return;
         }
       } catch (e) {
-        setLastError(String(e).slice(0, 120));
+        if (isExpectedPendingSessionError(e)) {
+          // Expected while dispatcher is still approving / submitting start_game.
+          setLastError(null);
+        } else {
+          setLastError(String(e).slice(0, 120));
+        }
       }
       setPollCount((c) => c + 1);
     };
@@ -342,6 +353,11 @@ function WaitingView(props: {
         <div className="pol-lobbyWaitingHint">
           Listening for dispatcher (tab sync + {props.chainBackend ? `chain poll #${pollCount + 1}` : 'no chain'})
         </div>
+        {!lastError && props.chainBackend && (
+          <div className="pol-lobbyWaitingHint" style={{ marginTop: '0.35rem', opacity: 0.75 }}>
+            Waiting for player 1 to confirm the on-chain start transaction...
+          </div>
+        )}
         {lastError && <div className="pol-lobbyError">{lastError}</div>}
       </div>
 
@@ -357,9 +373,20 @@ function WaitingView(props: {
 // ── main component ────────────────────────────────────────────────────────────
 
 export function LobbyScreen(props: LobbyScreenProps) {
-  const [phase, setPhase] = useState<LobbyPhase>('choose');
-  const [lobbyRole, setLobbyRole] = useState<'dispatcher' | 'assassin' | null>(null);
-  const [lobbyCode, setLobbyCode] = useState<LobbyCode | null>(null);
+  const bootRole = props.initialRole ?? null;
+  const [phase, setPhase] = useState<LobbyPhase>(bootRole === 'dispatcher' ? 'create' : bootRole === 'assassin' ? 'join' : 'choose');
+  const [lobbyRole, setLobbyRole] = useState<'dispatcher' | 'assassin' | null>(bootRole);
+  const [lobbyCode, setLobbyCode] = useState<LobbyCode | null>(
+    bootRole === 'dispatcher'
+      ? {
+          v: 1,
+          sid: generateSessionId(),
+          d: props.userAddress,
+          net: props.networkPassphrase,
+          cid: props.contractId,
+        }
+      : null
+  );
   const [acceptedLobby, setAcceptedLobby] = useState<LobbyCode | null>(null);
   const [responseCode, setResponseCode] = useState<string | null>(null);
 
