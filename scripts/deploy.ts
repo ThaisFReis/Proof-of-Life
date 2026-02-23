@@ -155,12 +155,13 @@ const walletSecrets: Record<string, string> = {};
 
 // Load existing secrets from .env if available
 let existingSecrets: Record<string, string | null> = {
+  admin: null,
   player1: null,
   player2: null,
 };
 
 const existingEnv = await readEnvFile('.env');
-for (const identity of ['player1', 'player2']) {
+for (const identity of ['admin', 'player1', 'player2']) {
   const key = `VITE_DEV_${identity.toUpperCase()}_SECRET`;
   const v = getEnvValue(existingEnv, key);
   if (v && v !== 'NOT_AVAILABLE') existingSecrets[identity] = v;
@@ -193,8 +194,10 @@ for (const contract of allContracts) {
 
 // Handle admin identity (needs to be in Stellar CLI for deployment)
 console.log('Setting up admin identity...');
-console.log('📝 Generating new admin identity...');
-const adminKeypair = Keypair.random();
+const adminKeypair =
+  existingSecrets.admin
+    ? (console.log('✅ Using existing admin from .env'), Keypair.fromSecret(existingSecrets.admin))
+    : (console.log('📝 Generating new admin identity...'), Keypair.random());
 
 walletAddresses.admin = adminKeypair.publicKey();
 
@@ -250,9 +253,10 @@ const deployed: Record<string, string> = { ...existingContractIds };
 let mockGameHubId = existingContractIds[mock.packageName] || "";
 if (shouldEnsureMock) {
   const candidateMockIds = [
+    // Prefer the shared hackathon Game Hub on Stellar testnet for compliance.
+    EXISTING_GAME_HUB_TESTNET_CONTRACT_ID,
     existingContractIds[mock.packageName],
     existingDeployment?.mockGameHubId,
-    EXISTING_GAME_HUB_TESTNET_CONTRACT_ID,
   ].filter(Boolean) as string[];
 
   for (const candidate of candidateMockIds) {
@@ -367,6 +371,7 @@ VITE_DEV_PLAYER1_ADDRESS=${walletAddresses.player1}
 VITE_DEV_PLAYER2_ADDRESS=${walletAddresses.player2}
 
 # Dev wallet secret keys (WARNING: Never commit this file!)
+VITE_DEV_ADMIN_SECRET=${adminSecret}
 VITE_DEV_PLAYER1_SECRET=${walletSecrets.player1}
 VITE_DEV_PLAYER2_SECRET=${walletSecrets.player2}
 `;
