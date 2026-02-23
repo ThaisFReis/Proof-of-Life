@@ -21,6 +21,7 @@ import {
 } from './sim/engine';
 import { getAvailableChadCommands } from './sim/chadOptions';
 import { getBootSequence, getIntroCallSequence } from './script/callScript';
+import { useSuspenseAudio } from './utils/useSuspenseAudio';
 import { getCellPlan, isBlockedTile, isChadSpawnable, isHideTile, listDoorMarkers, MAP_LABELS, ROOM_LEGEND } from './world/floorplan';
 import { appendChainLog, fakeTxHash, formatChainLine, mkChainContextFrom, type ChainLogEntry } from './chain/chainLog';
 import {
@@ -340,6 +341,7 @@ export function ProofOfLifeGame(props: {
   const [showRules, setShowRules] = useState(false); // Modal State
   const [showLogs, setShowLogs] = useState(false);   // Logs Modal State
   const [showGameFinishedModal, setShowGameFinishedModal] = useState(false);
+  const [finishedSessionSnapshot, setFinishedSessionSnapshot] = useState<SessionState | null>(null);
   const [assassinAddress, setAssassinAddress] = useState('');
   const [session, setSession] = useState<SessionState | null>(null);
   const [secret, setSecret] = useState<EncryptedSecret | null>(null);
@@ -399,6 +401,11 @@ export function ProofOfLifeGame(props: {
   const assassinSyncLastErrorRef = useRef<{ msg: string; at: number } | null>(null);
   const assassinSubmitBusyRef = useRef(false);
   const phaseTransitionMs = 220;
+  
+  // Game start tension audio logic
+  const isSetupOrLobby = uiPhase === 'setup' || uiPhase === 'lobby' || uiPhase === 'boot';
+  useSuspenseAudio(!isSetupOrLobby && uiPhase !== 'play' && !session?.ended);
+
   useEffect(() => {
     const el = chainLogScrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
@@ -449,8 +456,10 @@ export function ProofOfLifeGame(props: {
     const sid = session.sessionId >>> 0;
     if (finishedModalSessionRef.current === sid) return;
     finishedModalSessionRef.current = sid;
+    setFinishedSessionSnapshot(session);
+    if (uiPhase !== 'play') setUiPhase('play');
     setShowGameFinishedModal(true);
-  }, [session?.ended, session?.sessionId]);
+  }, [session, uiPhase]);
 
   useEffect(() => {
     const pending = pendingAssassinSessionKeyAuthRef.current;
@@ -771,6 +780,20 @@ export function ProofOfLifeGame(props: {
         : statusLabel === 'DESYNC'
           ? 'text-amber-300'
           : 'text-emerald-400';
+  const turnWaitMessage = useMemo(() => {
+    if (!session || session.mode !== 'two-player' || session.ended) return null;
+    if (playerRole === 'dispatcher' && session.phase === 'assassin') {
+      return 'WAITING: PLAYER 2 (ASSASSIN) IS PLAYING THIS TURN';
+    }
+    if (playerRole === 'assassin' && session.phase === 'dispatcher') {
+      return 'WAITING: PLAYER 1 (DISPATCHER) IS PLAYING THIS TURN';
+    }
+    if (playerRole === 'observer') {
+      return `WAITING: ${session.phase === 'dispatcher' ? 'PLAYER 1 (DISPATCHER)' : 'PLAYER 2 (ASSASSIN)'} TURN`;
+    }
+    return null;
+  }, [session, playerRole]);
+  const modalSessionForReport = session?.ended ? session : finishedSessionSnapshot;
   const proximityReadout = useMemo(() => {
     if (!lastPingResult) return null;
     const maxD2 = ((DEFAULT_SIM_CONFIG.gridW - 1) ** 2) + ((DEFAULT_SIM_CONFIG.gridH - 1) ** 2);
@@ -796,8 +819,9 @@ export function ProofOfLifeGame(props: {
     return { strengthPct, band, toneClass };
   }, [lastPingResult]);
   const sessionOutcomeSummary = useMemo(() => {
-    const outcome = session?.outcome;
-    const isTwoPlayer = session?.mode === 'two-player';
+    const modalSession = (session?.ended ? session : finishedSessionSnapshot);
+    const outcome = modalSession?.outcome;
+    const isTwoPlayer = modalSession?.mode === 'two-player';
 
     if (isAssassinClient) {
       switch (outcome) {
@@ -826,7 +850,7 @@ export function ProofOfLifeGame(props: {
       default:
         return { title: 'SESSION ENDED', tone: 'text-amber-300', detail: 'The game session has ended.' };
     }
-  }, [session?.outcome, session?.mode, isAssassinClient]);
+  }, [session, finishedSessionSnapshot, isAssassinClient]);
   const subtitleConversationLines = useMemo(() => getSubtitleConversationLinesForSession(session), [session]);
   const activeSubtitle = useMemo(() => {
     const m = activeSubtitleLine.match(/^([A-Z]+):\s*(.*)$/);
@@ -979,6 +1003,9 @@ export function ProofOfLifeGame(props: {
     }
     commandLockRef.current = false;
     setCommandLocked(false);
+    setShowGameFinishedModal(false);
+    setFinishedSessionSnapshot(null);
+    finishedModalSessionRef.current = null;
     // Cancel any scheduled script events from a previous run.
     while (timeouts.length) {
       const id = timeouts.pop();
@@ -1438,6 +1465,8 @@ export function ProofOfLifeGame(props: {
   const restartSyncedSession = () => {
     const nextSessionId = createRandomSessionId();
     setShowGameFinishedModal(false);
+    setFinishedSessionSnapshot(null);
+    finishedModalSessionRef.current = null;
     setSessionId(nextSessionId);
     if (dialogueUnlockTimerRef.current !== null) {
       window.clearTimeout(dialogueUnlockTimerRef.current);
@@ -1456,12 +1485,14 @@ export function ProofOfLifeGame(props: {
 
   const handleCreateNewSessionFromFinishedModal = () => {
     setShowGameFinishedModal(false);
+    setFinishedSessionSnapshot(null);
     finishedModalSessionRef.current = null;
     restartSyncedSession();
   };
 
   const handleBackToLobbyFromFinishedModal = () => {
     setShowGameFinishedModal(false);
+    setFinishedSessionSnapshot(null);
     finishedModalSessionRef.current = null;
     if (dialogueUnlockTimerRef.current !== null) {
       window.clearTimeout(dialogueUnlockTimerRef.current);
@@ -2560,6 +2591,9 @@ export function ProofOfLifeGame(props: {
     }
     commandLockRef.current = false;
     setCommandLocked(false);
+    setShowGameFinishedModal(false);
+    setFinishedSessionSnapshot(null);
+    finishedModalSessionRef.current = null;
     while (timeouts.length) {
       const id = timeouts.pop();
       if (typeof id === 'number') window.clearTimeout(id);
@@ -3342,6 +3376,11 @@ export function ProofOfLifeGame(props: {
                     RESTART SYNC
                   </button>
                 </>
+              ) : null}
+              {turnWaitMessage ? (
+                <div className="rounded border border-amber-400/30 bg-amber-500/10 px-2 py-1 text-[10px] tracking-wider text-amber-200">
+                  {turnWaitMessage}
+                </div>
               ) : null}
               <div className="pol-boardTopbarSep" />
 	              <div className="pol-boardMeta">
