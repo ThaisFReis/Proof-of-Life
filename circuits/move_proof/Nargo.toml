@@ -1,0 +1,7 @@
+[package]
+name = "move_proof"
+type = "bin"
+authors = ["proof-of-life"]
+
+[dependencies]
+

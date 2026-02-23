@@ -1,0 +1,7 @@
+[package]
+name = "ping_distance"
+type = "bin"
+authors = ["proof-of-life"]
+
+[dependencies]
+
