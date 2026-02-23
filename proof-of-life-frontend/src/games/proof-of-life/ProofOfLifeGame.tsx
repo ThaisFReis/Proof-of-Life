@@ -186,8 +186,8 @@ export function ProofOfLifeGame(props: {
   const [onchainSessionHealthy, setOnchainSessionHealthy] = useState(true);
   const [zkVerifiersReady, setZkVerifiersReady] = useState(true);
   const [activeSubtitleLine, setActiveSubtitleLine] = useState('...');
-  const [devMode, setDevMode] = useState(true); // Toggle for insecure_mode (dev convenience)
-  const devModeSessionRef = useRef<boolean>(true);
+  const [devMode, setDevMode] = useState(false); // Forced secure mode (PROD/ZK only)
+  const devModeSessionRef = useRef<boolean>(false);
   const verifierBypassModeRef = useRef<boolean>(false);
   const subtitleTimersRef = useRef<number[]>([]);
   const subtitleKeyRef = useRef('');
@@ -476,8 +476,8 @@ export function ProofOfLifeGame(props: {
     const chad = { x: s.chad_x ?? 5, y: s.chad_y ?? 5 };
     setSecret(mode === 'single' ? encryption.encrypt(createSecret(undefined, chad)) : null);
     setUiPhase('boot');
-    // Freeze DEV/PROD intent for this session to avoid mid-run toggle races.
-    devModeSessionRef.current = devMode;
+    // PROD-only: force secure mode for every session start.
+    devModeSessionRef.current = false;
     // Clear stale session key from any previous game so the memoized chainBackend
     // falls back to the dispatcher's wallet (correct source account + sequence).
     setSessionKeySecret(null);
@@ -2266,6 +2266,22 @@ export function ProofOfLifeGame(props: {
           {renderPhaseContent()}
         </div>
       </main>
+
+      {onchainBootstrapPending && (
+        <div className="pol-walletPendingOverlay" role="status" aria-live="polite" aria-atomic="true">
+          <div className="pol-walletPendingCard">
+            <div className="pol-walletPendingSpinner" aria-hidden="true">
+              <span />
+              <span />
+              <span />
+            </div>
+            <div className="pol-walletPendingText">
+              <div className="pol-walletPendingTitle">Opening Wallet Confirmation</div>
+              <div className="pol-walletPendingSub">Approve the transaction in your wallet modal to continue.</div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* LOGS MODAL */}
       <CRTModal

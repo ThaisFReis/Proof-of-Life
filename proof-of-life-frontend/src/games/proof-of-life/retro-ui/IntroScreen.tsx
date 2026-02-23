@@ -32,6 +32,7 @@ export function IntroScreen(props: IntroProps) {
   const [showLogin, setShowLogin] = useState(false);
   const configLocked = !props.wallet.isConnected;
   const isRealWallet = props.wallet.walletType === 'wallet';
+  const launchDisabled = !props.wallet.isConnected || (props.mode === 'two-player' && !props.assassinAddress.trim());
 
   useEffect(() => {
     const interval = setInterval(() => setBlink((b) => !b), 800);
@@ -212,32 +213,22 @@ export function IntroScreen(props: IntroProps) {
 
             <div className="pol-setupRow">
               <span>Protocol Security</span>
-              <div className="pol-segmented">
-                <button
-                  className={`pol-segmentedBtn ${props.devMode ? 'is-active is-copper' : ''}`}
-                  disabled={configLocked}
-                  onClick={() => props.setDevMode(true)}
-                >
-                  DEV (OPEN)
-                </button>
-                <button
-                  className={`pol-segmentedBtn ${!props.devMode ? 'is-active is-emerald' : ''}`}
-                  disabled={configLocked}
-                  onClick={() => props.setDevMode(false)}
-                >
-                  PROD (ZK)
-                </button>
-              </div>
+              <div className="pol-setupSecurityLock">PROD (ZK) LOCKED</div>
             </div>
 
             <div className="pol-setupActions">
               <button
                 className="pol-setupBtn pol-setupBtn--launch"
                 onClick={props.onStart}
-                disabled={!props.wallet.isConnected || (props.mode === 'two-player' && !props.assassinAddress.trim())}
+                disabled={launchDisabled}
               >
                 {props.mode === 'single' ? 'EXECUTE SOLO MISSION' : 'ESTABLISH DUAL SESSION'}
               </button>
+              {!launchDisabled && isRealWallet && (
+                <div className="pol-setupTxHint">
+                  Next step: your wallet will open a confirmation modal for the on-chain transaction.
+                </div>
+              )}
 
               <button onClick={() => setShowLogin(false)} className="pol-setupBack">
                 Abort Sequence (Back)
