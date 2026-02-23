@@ -1,85 +1,112 @@
 import { useEffect, useRef } from 'react';
+import suspenseAudioUrl from '../../../assets/Wendel_Scherer_-_Dark_Mind_(mp3.pm).mp3';
 
 export function useSuspenseAudio(active: boolean) {
-  const ctxRef = useRef<AudioContext | null>(null);
-  const gainRef = useRef<GainNode | null>(null);
+  const audioRefs = useRef<HTMLAudioElement[]>([]);
+  const currentIdx = useRef(0);
 
   useEffect(() => {
-    let fadeOutTimer: number;
+    let fadeInterval: number;
+    let loopCheckInterval: number;
 
     if (active) {
-      if (ctxRef.current) return;
-      try {
-        const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-        if (!AudioContextClass) return;
-        
-        const ctx = new AudioContextClass();
-        ctxRef.current = ctx;
-        
-        const masterGain = ctx.createGain();
-        masterGain.gain.setValueAtTime(0, ctx.currentTime);
-        masterGain.connect(ctx.destination);
-        gainRef.current = masterGain;
-
-        // Low cinematic rumble
-        const osc1 = ctx.createOscillator();
-        osc1.type = 'triangle';
-        osc1.frequency.setValueAtTime(45, ctx.currentTime);
-
-        // Detuned for beating ominous feel
-        const osc2 = ctx.createOscillator();
-        osc2.type = 'sawtooth';
-        osc2.frequency.setValueAtTime(45.5, ctx.currentTime);
-        
-        // High harmonic for tension
-        const osc3 = ctx.createOscillator();
-        osc3.type = 'sine';
-        osc3.frequency.setValueAtTime(90.2, ctx.currentTime);
-        const gain3 = ctx.createGain();
-        gain3.gain.setValueAtTime(0.08, ctx.currentTime);
-        osc3.connect(gain3);
-
-        const filter = ctx.createBiquadFilter();
-        filter.type = 'lowpass';
-        // Keep it muffled and distant
-        filter.frequency.setValueAtTime(150, ctx.currentTime); 
-
-        osc1.connect(filter);
-        osc2.connect(filter);
-        gain3.connect(filter);
-        filter.connect(masterGain);
-
-        osc1.start();
-        osc2.start();
-        osc3.start();
-
-        // Slow cinematic fade-in (4 seconds)
-        masterGain.gain.linearRampToValueAtTime(0.25, ctx.currentTime + 4);
-      } catch (e) {
-        console.warn('Suspense audio init failed:', e);
+      if (audioRefs.current.length === 0) {
+        audioRefs.current = [new Audio(suspenseAudioUrl), new Audio(suspenseAudioUrl)];
+        audioRefs.current.forEach(a => {
+          a.volume = 0;
+          // Preload
+          a.load();
+        });
       }
+      
+      const audio = audioRefs.current[currentIdx.current];
+      audio.play().catch(e => console.warn('Suspense audio play failed:', e));
+
+      // Quick fade-in
+      let vol = audio.volume;
+      fadeInterval = window.setInterval(() => {
+        vol += 0.02;
+        if (vol >= 0.45) { // Max volume 0.45 
+          vol = 0.45;
+          clearInterval(fadeInterval);
+        }
+        if (audioRefs.current[currentIdx.current]) {
+           audioRefs.current[currentIdx.current].volume = vol;
+        }
+      }, 50);
+
+      // Cross-fade looping logic
+      // The track is ~30s. We trigger the next track a few seconds before the end
+      // and fade the current one out.
+      const crossfadeDuration = 3.0; // 3 seconds crossfade
+      
+      loopCheckInterval = window.setInterval(() => {
+        const curAudio = audioRefs.current[currentIdx.current];
+        if (!curAudio || isNaN(curAudio.duration)) return;
+        
+        // If we are getting close to the end
+        if (curAudio.currentTime > curAudio.duration - crossfadeDuration) {
+           const nextIdx = (currentIdx.current + 1) % 2;
+           const nextAudio = audioRefs.current[nextIdx];
+           
+           // Start the next audio
+           nextAudio.currentTime = 0;
+           nextAudio.volume = 0;
+           nextAudio.play().catch(() => {});
+           
+           // Fade out current, fade in next
+           let cfTime = 0;
+           const cfInterval = window.setInterval(() => {
+             cfTime += 0.1;
+             const ratio = Math.min(1, cfTime / crossfadeDuration);
+             
+             if (curAudio) curAudio.volume = Math.max(0, 0.45 * (1 - ratio));
+             if (nextAudio) nextAudio.volume = Math.min(0.45, 0.45 * ratio);
+             
+             if (ratio >= 1) {
+               window.clearInterval(cfInterval);
+               curAudio.pause();
+               curAudio.currentTime = 0;
+             }
+           }, 100);
+           
+           currentIdx.current = nextIdx;
+        }
+      }, 500);
+
     } else {
-      if (ctxRef.current && gainRef.current) {
-        const ctx = ctxRef.current;
-        // Fade out
-        gainRef.current.gain.linearRampToValueAtTime(0, ctx.currentTime + 3);
-        fadeOutTimer = window.setTimeout(() => {
-          if (ctxRef.current === ctx) {
-            ctx.close().catch(() => {});
-            ctxRef.current = null;
-            gainRef.current = null;
+      // Fade out all active audio
+      if (audioRefs.current.length > 0) {
+        fadeInterval = window.setInterval(() => {
+          let allMuted = true;
+          audioRefs.current.forEach(audio => {
+            let vol = audio.volume;
+            vol -= 0.05;
+            if (vol <= 0) {
+              vol = 0;
+              audio.pause();
+              audio.currentTime = 0;
+            } else {
+              allMuted = false;
+            }
+            audio.volume = vol;
+          });
+          
+          if (allMuted) {
+            clearInterval(fadeInterval);
           }
-        }, 3100);
+        }, 100);
       }
     }
 
     return () => {
-      // Clean up timer on unmount
-      if (fadeOutTimer) window.clearTimeout(fadeOutTimer);
-      // Close context immediately on unmount if it was active
-      if (ctxRef.current && !active) {
-         ctxRef.current.close().catch(() => {});
-         ctxRef.current = null;
+      if (fadeInterval) window.clearInterval(fadeInterval);
+      if (loopCheckInterval) window.clearInterval(loopCheckInterval);
+      if (!active) {
+        audioRefs.current.forEach(audio => {
+          audio.pause();
+          audio.currentTime = 0;
+        });
       }
     };
   }, [active]);

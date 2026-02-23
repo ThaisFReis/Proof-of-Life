@@ -341,6 +341,7 @@ export function ProofOfLifeGame(props: {
   const [showRules, setShowRules] = useState(false); // Modal State
   const [showLogs, setShowLogs] = useState(false);   // Logs Modal State
   const [showGameFinishedModal, setShowGameFinishedModal] = useState(false);
+  const [isAudioMuted, setIsAudioMuted] = useState(false);
   const [finishedSessionSnapshot, setFinishedSessionSnapshot] = useState<SessionState | null>(null);
   const [assassinAddress, setAssassinAddress] = useState('');
   const [session, setSession] = useState<SessionState | null>(null);
@@ -404,7 +405,7 @@ export function ProofOfLifeGame(props: {
   
   // Game start tension audio logic
   const isSetupOrLobby = uiPhase === 'setup' || uiPhase === 'lobby' || uiPhase === 'boot';
-  useSuspenseAudio(!isSetupOrLobby && uiPhase !== 'play' && !session?.ended);
+  useSuspenseAudio(!isAudioMuted && !isSetupOrLobby && !session?.ended);
 
   useEffect(() => {
     const el = chainLogScrollRef.current;
@@ -3347,8 +3348,16 @@ export function ProofOfLifeGame(props: {
               <div className="pol-boardBeacon">
                 <div className="pol-boardBeaconCore" />
               </div>
-              <div>
+              <div className="flex items-center gap-4">
                 <div className="pol-boardTitle">PROOF OF LIFE</div>
+                <button 
+                  onClick={() => setIsAudioMuted(!isAudioMuted)}
+                  className="pol-boardTopbarBtn pol-boardTopbarBtn--ghost"
+                  title={isAudioMuted ? "Unmute Music" : "Mute Music"}
+                  style={{ minWidth: 0, paddingLeft: '0.5rem', paddingRight: '0.5rem', fontSize: '1rem' }}
+                >
+                  {isAudioMuted ? "🔇" : "🔊"}
+                </button>
               </div>
            </div>
            
@@ -3688,12 +3697,12 @@ export function ProofOfLifeGame(props: {
 
       {/* LOGS MODAL */}
       <CRTModal
-        isOpen={showGameFinishedModal && !!session?.ended}
+        isOpen={showGameFinishedModal && !!modalSessionForReport}
         onClose={() => setShowGameFinishedModal(false)}
         title="SESSION REPORT"
         actionLabel="CLOSE"
       >
-        {session ? (
+        {modalSessionForReport ? (
           <div className="space-y-4 text-xs">
             <div className="rounded border border-white/10 bg-black/40 p-3">
               <div className={["text-sm font-bold tracking-widest", sessionOutcomeSummary.tone].join(' ')}>
@@ -3705,31 +3714,31 @@ export function ProofOfLifeGame(props: {
             <div className="grid grid-cols-2 gap-3">
               <div className="rounded border border-white/10 bg-white/5 p-3">
                 <div className="text-white/45 uppercase tracking-wider">Session</div>
-                <div className="mt-1 text-cyan-300 font-semibold">{session.sessionId}</div>
+                <div className="mt-1 text-cyan-300 font-semibold">{modalSessionForReport.sessionId}</div>
               </div>
               <div className="rounded border border-white/10 bg-white/5 p-3">
                 <div className="text-white/45 uppercase tracking-wider">Mode</div>
-                <div className="mt-1 text-white">{session.mode === 'two-player' ? 'Two Player' : 'Single Player'}</div>
+                <div className="mt-1 text-white">{modalSessionForReport.mode === 'two-player' ? 'Two Player' : 'Single Player'}</div>
               </div>
               <div className="rounded border border-white/10 bg-white/5 p-3">
                 <div className="text-white/45 uppercase tracking-wider">Turns</div>
-                <div className="mt-1 text-white">{session.turn}</div>
+                <div className="mt-1 text-white">{modalSessionForReport.turn}</div>
               </div>
               <div className="rounded border border-white/10 bg-white/5 p-3">
                 <div className="text-white/45 uppercase tracking-wider">Battery / Alpha</div>
-                <div className="mt-1 text-white">{session.battery} / {session.alpha ?? '-'}</div>
+                <div className="mt-1 text-white">{modalSessionForReport.battery} / {modalSessionForReport.alpha ?? '-'}</div>
               </div>
             </div>
 
-            {session.log.length ? (
+            {modalSessionForReport.log.length ? (
               <div className="rounded border border-white/10 bg-white/5 p-3">
                 <div className="text-white/45 uppercase tracking-wider">Last Event</div>
-                <div className="mt-2 text-white/80">{session.log[session.log.length - 1]}</div>
+                <div className="mt-2 text-white/80">{modalSessionForReport.log[modalSessionForReport.log.length - 1]}</div>
               </div>
             ) : null}
 
             <div className="flex justify-end gap-2">
-              {session.mode === 'two-player' ? (
+              {modalSessionForReport.mode === 'two-player' ? (
                 <button
                   onClick={handleBackToLobbyFromFinishedModal}
                   className="px-4 py-2 rounded border border-amber-400/30 bg-amber-500/10 text-amber-300 text-xs tracking-widest uppercase hover:bg-amber-500/20"
