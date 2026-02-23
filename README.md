@@ -83,6 +83,60 @@ bun run publish my-game --build       # Export + build production frontend
 
 - Dev wallets are generated during `bun run setup` and stored in the root `.env`.
 - Production builds read runtime config from `public/game-studio-config.js`.
+- Proof-of-Life ZK runtime troubleshooting and implementation notes:
+  - `ZK_RUNTIME_NOTES.md`
+
+## Proof-of-Life ZK: Checklist (Copy/Paste)
+
+Use this sequence after contract/circuit changes to avoid `InvalidProof (#22)` and `ProofSessionMismatch (#18)`.
+
+```bash
+# 0) Go to project root
+cd Stellar-Game-Studio
+
+# 1) Build verifier WASM
+cd contracts/ultrahonk-verifier
+stellar contract build
+cd ../..
+
+# 2) Build ZK artifacts (circuits + proof/vk assets)
+bun run zk:build
+
+# 3) Deploy proof-of-life (if ABI/contract changed)
+bun run deploy proof-of-life
+
+# 4) Wire verifiers to the current game contract id
+bun run scripts/zk_wire_verifiers.ts \
+  --admin-secret "$(grep '^VITE_DEV_ADMIN_SECRET=' .env | cut -d= -f2-)" \
+  --game-id "$(grep '^VITE_PROOF_OF_LIFE_CONTRACT_ID=' .env | cut -d= -f2-)" \
+  --network testnet \
+  --verifier-wasm contracts/ultrahonk-verifier/target/wasm32v1-none/release/rs_soroban_ultrahonk.wasm \
+  --vk-ping circuits/ping_distance/target/vk \
+  --vk-turn circuits/turn_status/target/vk \
+  --vk-move circuits/move_proof/target/vk
+
+# 5) Regenerate bindings
+bun run bindings proof-of-life
+
+# 6) Start prover and frontend
+PORT=8788 bun run zk:prover
+# in another terminal
+cd proof-of-life-frontend && bun run dev
+```
+
+### Multiline command pitfall
+
+When using `\` line continuation in `zsh/bash`, it must be the last character on the line.
+
+- Wrong: `\ ` (backslash + trailing space)
+- Wrong: splitting a path token into two lines
+- Symptoms: `unknown argument ...` or `missing value ...`
+
+### Current Testnet Note (2026-02-17)
+
+- If you still see `Error(Contract, #22)` on `submit_ping_proof`, this currently indicates verifier compatibility issues (not only frontend sequencing).
+- Frontend runtime now contains a per-session verifier bypass mode to keep turn flow synchronized while verifier internals are being fixed.
+- Full proof-verified secure path requires resolving verifier compatibility in `contracts/ultrahonk-verifier`.
 
 Interface for game hub:
 ```
