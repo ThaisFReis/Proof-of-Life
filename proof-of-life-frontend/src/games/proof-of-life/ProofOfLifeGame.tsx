@@ -48,8 +48,6 @@ import { encryption, type EncryptedSecret } from './utils/encryption';
 import { Keypair, TransactionBuilder } from '@stellar/stellar-sdk';
 
 const createRandomSessionId = (): number => {
-  return 12345; // DEBUG: Fixed small session ID
-  /*
   if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
     let value = 0;
     const buffer = new Uint32Array(1);
@@ -60,7 +58,6 @@ const createRandomSessionId = (): number => {
     return value;
   }
   return (Math.floor(Math.random() * 0xffffffff) >>> 0) || 1;
-  */
 };
 
 const TOWERS: { id: TowerId; label: string }[] = [
@@ -340,6 +337,7 @@ export function ProofOfLifeGame(props: {
   const [sessionId, setSessionId] = useState(() => createRandomSessionId());
   const [showRules, setShowRules] = useState(false); // Modal State
   const [showLogs, setShowLogs] = useState(false);   // Logs Modal State
+  const [showGameFinishedModal, setShowGameFinishedModal] = useState(false);
   const [assassinAddress, setAssassinAddress] = useState('');
   const [session, setSession] = useState<SessionState | null>(null);
   const [secret, setSecret] = useState<EncryptedSecret | null>(null);
@@ -391,6 +389,7 @@ export function ProofOfLifeGame(props: {
   const phaseEnterTimerRef = useRef<number | null>(null);
   const latestSessionRef = useRef<SessionState | null>(null);
   const latestSecretRef = useRef<EncryptedSecret | null>(null);
+  const finishedModalSessionRef = useRef<number | null>(null);
   const assassinSyncPollBusyRef = useRef(false);
   const assassinSyncWarnedTurnRef = useRef<number | null>(null);
   const assassinSyncLastErrorRef = useRef<{ msg: string; at: number } | null>(null);
@@ -440,6 +439,14 @@ export function ProofOfLifeGame(props: {
   useEffect(() => {
     latestSecretRef.current = secret;
   }, [secret]);
+
+  useEffect(() => {
+    if (!session?.ended) return;
+    const sid = session.sessionId >>> 0;
+    if (finishedModalSessionRef.current === sid) return;
+    finishedModalSessionRef.current = sid;
+    setShowGameFinishedModal(true);
+  }, [session?.ended, session?.sessionId]);
 
   const prover = useMemo(() => {
     const url = (import.meta as any)?.env?.VITE_ZK_PROVER_URL ?? 'http://127.0.0.1:8788';
@@ -668,6 +675,21 @@ export function ProofOfLifeGame(props: {
 
     return { strengthPct, band, toneClass };
   }, [lastPingResult]);
+  const sessionOutcomeSummary = useMemo(() => {
+    const outcome = session?.outcome;
+    switch (outcome) {
+      case 'win_extraction':
+        return { title: 'MISSION SUCCESS', tone: 'text-emerald-300', detail: 'Chad survived and reached extraction.' };
+      case 'loss_caught':
+        return { title: 'MISSION FAILED', tone: 'text-red-300', detail: 'Chad was caught by the assassin.' };
+      case 'loss_blackout':
+        return { title: 'MISSION FAILED', tone: 'text-red-300', detail: 'Generator power reached zero (blackout).' };
+      case 'loss_panic':
+        return { title: 'MISSION FAILED', tone: 'text-red-300', detail: 'Chad panicked and the run collapsed.' };
+      default:
+        return { title: 'SESSION ENDED', tone: 'text-amber-300', detail: 'The game session has ended.' };
+    }
+  }, [session?.outcome]);
   const subtitleConversationLines = useMemo(() => getSubtitleConversationLinesForSession(session), [session]);
   const activeSubtitle = useMemo(() => {
     const m = activeSubtitleLine.match(/^([A-Z]+):\s*(.*)$/);
@@ -1278,6 +1300,7 @@ export function ProofOfLifeGame(props: {
 
   const restartSyncedSession = () => {
     const nextSessionId = createRandomSessionId();
+    setShowGameFinishedModal(false);
     setSessionId(nextSessionId);
     if (dialogueUnlockTimerRef.current !== null) {
       window.clearTimeout(dialogueUnlockTimerRef.current);
@@ -1292,6 +1315,12 @@ export function ProofOfLifeGame(props: {
     setOnchainSessionHealthy(true);
     onchainSessionHealthyRef.current = true;
     start(nextSessionId);
+  };
+
+  const handleCreateNewSessionFromFinishedModal = () => {
+    setShowGameFinishedModal(false);
+    finishedModalSessionRef.current = null;
+    restartSyncedSession();
   };
 
   const arm = () => {
@@ -3517,6 +3546,59 @@ export function ProofOfLifeGame(props: {
       )}
 
       {/* LOGS MODAL */}
+      <CRTModal
+        isOpen={showGameFinishedModal && !!session?.ended}
+        onClose={() => setShowGameFinishedModal(false)}
+        title="SESSION REPORT"
+        actionLabel="CLOSE"
+      >
+        {session ? (
+          <div className="space-y-4 text-xs">
+            <div className="rounded border border-white/10 bg-black/40 p-3">
+              <div className={["text-sm font-bold tracking-widest", sessionOutcomeSummary.tone].join(' ')}>
+                {sessionOutcomeSummary.title}
+              </div>
+              <div className="mt-1 text-white/70">{sessionOutcomeSummary.detail}</div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div className="rounded border border-white/10 bg-white/5 p-3">
+                <div className="text-white/45 uppercase tracking-wider">Session</div>
+                <div className="mt-1 text-cyan-300 font-semibold">{session.sessionId}</div>
+              </div>
+              <div className="rounded border border-white/10 bg-white/5 p-3">
+                <div className="text-white/45 uppercase tracking-wider">Mode</div>
+                <div className="mt-1 text-white">{session.mode === 'two-player' ? 'Two Player' : 'Single Player'}</div>
+              </div>
+              <div className="rounded border border-white/10 bg-white/5 p-3">
+                <div className="text-white/45 uppercase tracking-wider">Turns</div>
+                <div className="mt-1 text-white">{session.turn}</div>
+              </div>
+              <div className="rounded border border-white/10 bg-white/5 p-3">
+                <div className="text-white/45 uppercase tracking-wider">Battery / Alpha</div>
+                <div className="mt-1 text-white">{session.battery} / {session.alpha ?? '-'}</div>
+              </div>
+            </div>
+
+            {session.log.length ? (
+              <div className="rounded border border-white/10 bg-white/5 p-3">
+                <div className="text-white/45 uppercase tracking-wider">Last Event</div>
+                <div className="mt-2 text-white/80">{session.log[session.log.length - 1]}</div>
+              </div>
+            ) : null}
+
+            <div className="flex justify-end">
+              <button
+                onClick={handleCreateNewSessionFromFinishedModal}
+                className="px-4 py-2 rounded border border-cyan-400/30 bg-cyan-500/10 text-cyan-300 text-xs tracking-widest uppercase hover:bg-cyan-500/20"
+              >
+                Create New Session
+              </button>
+            </div>
+          </div>
+        ) : null}
+      </CRTModal>
+
       <CRTModal
         isOpen={showLogs}
         onClose={() => setShowLogs(false)}
