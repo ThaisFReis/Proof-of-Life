@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { config } from './config';
 import { Layout } from './components/Layout';
 import { GamesCatalog } from './components/GamesCatalog';
@@ -51,6 +51,11 @@ const buildPath = (page: Page) => {
 
 function App() {
   const [page, setPage] = useState<Page>(() => resolvePageFromLocation());
+  const [visiblePage, setVisiblePage] = useState<Page>(() => resolvePageFromLocation());
+  const [transitionStage, setTransitionStage] = useState<'idle' | 'exiting' | 'entering'>('idle');
+  const exitTimerRef = useRef<number | null>(null);
+  const enterTimerRef = useRef<number | null>(null);
+  const transitionDurationMs = 220;
   const hasAnyContracts = Object.keys(config.contractIds).length > 0;
 
   const navigate = (next: Page) => {
@@ -82,6 +87,41 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    if (page === visiblePage) return;
+
+    if (exitTimerRef.current) {
+      window.clearTimeout(exitTimerRef.current);
+      exitTimerRef.current = null;
+    }
+
+    if (enterTimerRef.current) {
+      window.clearTimeout(enterTimerRef.current);
+      enterTimerRef.current = null;
+    }
+
+    setTransitionStage('exiting');
+
+    exitTimerRef.current = window.setTimeout(() => {
+      setVisiblePage(page);
+      setTransitionStage('entering');
+
+      enterTimerRef.current = window.setTimeout(() => {
+        setTransitionStage('idle');
+        enterTimerRef.current = null;
+      }, transitionDurationMs);
+
+      exitTimerRef.current = null;
+    }, transitionDurationMs);
+  }, [page, visiblePage]);
+
+  useEffect(() => {
+    return () => {
+      if (exitTimerRef.current) window.clearTimeout(exitTimerRef.current);
+      if (enterTimerRef.current) window.clearTimeout(enterTimerRef.current);
+    };
+  }, []);
+
   return (
     <Layout currentPage={page} onNavigate={navigate}>
       {!hasAnyContracts && (
@@ -94,9 +134,11 @@ function App() {
         </div>
       )}
 
-      {page === 'docs' && <DocsPage />}
-      {page === 'games' && <GamesCatalog onBack={() => navigate('home')} />}
-      {page === 'home' && <HomePage onNavigate={navigate} />}
+      <div className={`page-transition page-transition-${transitionStage}`}>
+        {visiblePage === 'docs' && <DocsPage />}
+        {visiblePage === 'games' && <GamesCatalog onBack={() => navigate('home')} />}
+        {visiblePage === 'home' && <HomePage onNavigate={navigate} />}
+      </div>
     </Layout>
   );
 }

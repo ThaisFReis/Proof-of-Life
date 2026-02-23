@@ -143,7 +143,9 @@ export function Resources({ onBack }: ResourcesProps) {
       </aside>
 
       <main className="resources-content">
-        <DocumentationContent section={activeSection} />
+        <div key={activeSection} className="resources-section-transition">
+          <DocumentationContent section={activeSection} />
+        </div>
       </main>
     </div>
   );
