@@ -1,0 +1,125 @@
+.studio {
+  position: relative;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  color: var(--color-ink);
+  background: var(--color-bg);
+  overflow: hidden;
+}
+
+
+
+.studio-header,
+.studio-main,
+.studio-footer {
+  position: relative;
+  z-index: 1;
+}
+
+.studio-header {
+  max-width: 1200px;
+  margin: 0 auto;
+  width: 100%;
+  padding: 2.75rem 2.5rem 1.5rem;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 2rem;
+}
+
+.brand {
+  max-width: 560px;
+  animation: fadeUp 0.6s ease both;
+}
+
+.brand-title {
+  font-family: var(--font-serif);
+  font-size: clamp(2rem, 3vw + 1rem, 3.6rem);
+  line-height: 1.05;
+  margin: 0 0 0.5rem;
+  text-wrap: balance;
+}
+
+.brand-subtitle {
+  color: var(--color-ink-muted);
+  font-size: 1.05rem;
+  margin: 0;
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.network-pill {
+  padding: 0.4rem 0.9rem;
+  border-radius: 999px;
+  border: 1px solid var(--color-ink);
+  font-size: 0.75rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  background: rgba(255, 255, 255, 0.9);
+  font-family: var(--font-display);
+}
+
+.network-pill.dev-pill {
+  border-color: rgba(0, 167, 181, 0.6);
+  background: rgba(0, 167, 181, 0.15);
+  color: var(--color-ink);
+}
+
+.studio-main {
+  max-width: 1200px;
+  margin: 0 auto;
+  width: 100%;
+  padding: 0 2.5rem 3rem;
+  flex: 1;
+}
+
+.studio-footer {
+  max-width: 1200px;
+  margin: 0 auto 2rem;
+  width: 100%;
+  padding: 0 2.5rem;
+  display: flex;
+  justify-content: flex-end;
+  text-align: right;
+  gap: 1.5rem;
+  color: var(--color-ink-muted);
+  font-size: 0.75rem;
+}
+
+
+
+@keyframes fadeUp {
+  from {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (max-width: 960px) {
+  .studio-header {
+    flex-direction: column;
+    padding: 2.25rem 1.75rem 1rem;
+  }
+
+  .studio-main {
+    padding: 0 1.75rem 2.5rem;
+  }
+
+  .studio-footer {
+    justify-content: flex-end;
+    padding: 0 1.75rem;
+  }
+}
+
+@media (max-width: 600px) {}
