@@ -393,6 +393,7 @@ export function ProofOfLifeGame(props: {
   const latestSessionRef = useRef<SessionState | null>(null);
   const latestSecretRef = useRef<EncryptedSecret | null>(null);
   const finishedModalSessionRef = useRef<number | null>(null);
+  const pendingAssassinSessionKeyAuthRef = useRef<{ sid: number; assassinAddr: string; token: number } | null>(null);
   const assassinSyncPollBusyRef = useRef(false);
   const assassinSyncWarnedTurnRef = useRef<number | null>(null);
   const assassinSyncLastErrorRef = useRef<{ msg: string; at: number } | null>(null);
@@ -450,6 +451,108 @@ export function ProofOfLifeGame(props: {
     finishedModalSessionRef.current = sid;
     setShowGameFinishedModal(true);
   }, [session?.ended, session?.sessionId]);
+
+  useEffect(() => {
+    const pending = pendingAssassinSessionKeyAuthRef.current;
+    if (!pending) return;
+    if (uiPhase !== 'play') return;
+    if (!ENABLE_SESSION_KEY_MODE) return;
+    if (wallet.walletType !== 'wallet') return;
+    if (user === 'GUEST' || user !== pending.assassinAddr) return;
+
+    pendingAssassinSessionKeyAuthRef.current = null;
+
+    void (async () => {
+      const getSigner = props.getContractSigner;
+      if (!getSigner) return;
+
+      const sid = pending.sid;
+      const assassinAddr = pending.assassinAddr;
+      const sessionKeyPollToken = pending.token;
+
+      const stillCurrentSession = () =>
+        activeSessionIdRef.current === sid && sessionKeyPollTokenRef.current === sessionKeyPollToken;
+
+      const authBackend = new ChainBackend(
+        { rpcUrl: appConfig.rpcUrl, networkPassphrase: appConfig.networkPassphrase, contractId: appConfig.proofOfLifeId },
+        getSigner(),
+        user
+      );
+
+      try {
+        let sessionVisible = false;
+        for (let i = 0; i < SESSION_KEY_VISIBILITY_POLL_ATTEMPTS; i++) {
+          if (!stillCurrentSession()) return;
+          try {
+            const sCheck = await authBackend.getSession(sid);
+            if (typeof sCheck.sessionId === 'number') {
+              sessionVisible = true;
+              break;
+            }
+          } catch {
+            // Dispatcher may still be waiting on testnet settlement.
+          }
+          if (i < SESSION_KEY_VISIBILITY_POLL_ATTEMPTS - 1) await sleep(SESSION_KEY_POLL_INTERVAL_MS);
+        }
+
+        if (!stillCurrentSession()) return;
+        if (!sessionVisible) {
+          setChainLog((l) =>
+            appendChainLog(l, {
+              ts: Date.now(),
+              level: 'WARN',
+              msg: `SESSION KEY authorize skipped for assassin (session not visible yet) session=${sid}; wallet-per-tx mode will continue`,
+            })
+          );
+          return;
+        }
+
+        const sessionKey = Keypair.random();
+        if (appConfig.networkPassphrase.includes('Test')) {
+          await fundSessionKeyOnTestnet(sessionKey.publicKey());
+        }
+        if (!stillCurrentSession()) return;
+
+        const assassinAllowMask =
+          SESSION_ALLOW_COMMIT_LOCATION |
+          SESSION_ALLOW_SUBMIT_PING_PROOF |
+          SESSION_ALLOW_SUBMIT_MOVE_PROOF |
+          SESSION_ALLOW_SUBMIT_TURN_STATUS_PROOF |
+          SESSION_ALLOW_ASSASSIN_TICK;
+
+        const r = await authBackend.authorizeSessionKey({
+          owner: assassinAddr,
+          sessionId: sid,
+          delegate: sessionKey.publicKey(),
+          ttlLedgers: Math.max(1, SESSION_KEY_TTL_LEDGERS),
+          maxWrites: Math.max(1, SESSION_KEY_MAX_WRITES),
+          dispatcherAllowMask: 0,
+          assassinAllowMask,
+        });
+
+        if (!stillCurrentSession()) return;
+        setSessionKeySecret(sessionKey.secret());
+        setSessionKeyPublic(sessionKey.publicKey());
+        setChainLog((l) =>
+          appendChainLog(l, {
+            ts: Date.now(),
+            level: 'INFO',
+            msg: `TX ${r.txHash ?? 'UNKNOWN'} ok authorize_session_key delegate=${sessionKey.publicKey().slice(0, 8)}... [ASSASSIN] one-confirm mode enabled`,
+          })
+        );
+      } catch (e) {
+        if (!stillCurrentSession()) return;
+        const h = tryExtractTxHashFromError(e);
+        setChainLog((l) =>
+          appendChainLog(l, {
+            ts: Date.now(),
+            level: 'WARN',
+            msg: `assassin authorize_session_key failed${h ? ` (hash=${h})` : ''}; wallet-per-tx mode will continue: ${String(e)}`,
+          })
+        );
+      }
+    })();
+  }, [uiPhase, wallet.walletType, user, props.getContractSigner]);
 
   const prover = useMemo(() => {
     const url = (import.meta as any)?.env?.VITE_ZK_PROVER_URL ?? 'http://127.0.0.1:8788';
@@ -694,6 +797,23 @@ export function ProofOfLifeGame(props: {
   }, [lastPingResult]);
   const sessionOutcomeSummary = useMemo(() => {
     const outcome = session?.outcome;
+    const isTwoPlayer = session?.mode === 'two-player';
+
+    if (isAssassinClient) {
+      switch (outcome) {
+        case 'win_extraction':
+          return { title: 'MISSION FAILED', tone: 'text-red-300', detail: 'Chad survived and reached extraction.' };
+        case 'loss_caught':
+          return { title: 'MISSION SUCCESS', tone: 'text-emerald-300', detail: 'Chad was caught.' };
+        case 'loss_blackout':
+          return { title: 'MISSION SUCCESS', tone: 'text-emerald-300', detail: 'Generator power reached zero (blackout).' };
+        case 'loss_panic':
+          return { title: 'MISSION SUCCESS', tone: 'text-emerald-300', detail: 'Chad panicked and the run collapsed.' };
+        default:
+          return { title: 'SESSION ENDED', tone: 'text-amber-300', detail: 'The game session has ended.' };
+      }
+    }
+
     switch (outcome) {
       case 'win_extraction':
         return { title: 'MISSION SUCCESS', tone: 'text-emerald-300', detail: 'Chad survived and reached extraction.' };
@@ -706,7 +826,7 @@ export function ProofOfLifeGame(props: {
       default:
         return { title: 'SESSION ENDED', tone: 'text-amber-300', detail: 'The game session has ended.' };
     }
-  }, [session?.outcome]);
+  }, [session?.outcome, session?.mode, isAssassinClient]);
   const subtitleConversationLines = useMemo(() => getSubtitleConversationLinesForSession(session), [session]);
   const activeSubtitle = useMemo(() => {
     const m = activeSubtitleLine.match(/^([A-Z]+):\s*(.*)$/);
@@ -2478,92 +2598,7 @@ export function ProofOfLifeGame(props: {
 
     const wantsSingleConfirm = ENABLE_SESSION_KEY_MODE && wallet.walletType === 'wallet' && user !== 'GUEST';
     if (wantsSingleConfirm && user === assassinAddr) {
-      void (async () => {
-        const getSigner = props.getContractSigner;
-        if (!getSigner) return;
-
-        const stillCurrentSession = () =>
-          activeSessionIdRef.current === sid && sessionKeyPollTokenRef.current === sessionKeyPollToken;
-
-        const authBackend = new ChainBackend(
-          { rpcUrl: appConfig.rpcUrl, networkPassphrase: appConfig.networkPassphrase, contractId: appConfig.proofOfLifeId },
-          getSigner(),
-          user
-        );
-
-        try {
-          let sessionVisible = false;
-          for (let i = 0; i < SESSION_KEY_VISIBILITY_POLL_ATTEMPTS; i++) {
-            if (!stillCurrentSession()) return;
-            try {
-              const sCheck = await authBackend.getSession(sid);
-              if (typeof sCheck.sessionId === 'number') {
-                sessionVisible = true;
-                break;
-              }
-            } catch {
-              // Dispatcher may still be waiting on testnet settlement.
-            }
-            if (i < SESSION_KEY_VISIBILITY_POLL_ATTEMPTS - 1) await sleep(SESSION_KEY_POLL_INTERVAL_MS);
-          }
-
-          if (!stillCurrentSession()) return;
-          if (!sessionVisible) {
-            setChainLog((l) =>
-              appendChainLog(l, {
-                ts: Date.now(),
-                level: 'WARN',
-                msg: `SESSION KEY authorize skipped for assassin (session not visible yet) session=${sid}; wallet-per-tx mode will continue`,
-              })
-            );
-            return;
-          }
-
-          const sessionKey = Keypair.random();
-          if (appConfig.networkPassphrase.includes('Test')) {
-            await fundSessionKeyOnTestnet(sessionKey.publicKey());
-          }
-          if (!stillCurrentSession()) return;
-
-          const assassinAllowMask =
-            SESSION_ALLOW_COMMIT_LOCATION |
-            SESSION_ALLOW_SUBMIT_PING_PROOF |
-            SESSION_ALLOW_SUBMIT_MOVE_PROOF |
-            SESSION_ALLOW_SUBMIT_TURN_STATUS_PROOF |
-            SESSION_ALLOW_ASSASSIN_TICK;
-
-          const r = await authBackend.authorizeSessionKey({
-            owner: assassinAddr,
-            sessionId: sid,
-            delegate: sessionKey.publicKey(),
-            ttlLedgers: Math.max(1, SESSION_KEY_TTL_LEDGERS),
-            maxWrites: Math.max(1, SESSION_KEY_MAX_WRITES),
-            dispatcherAllowMask: 0,
-            assassinAllowMask,
-          });
-
-          if (!stillCurrentSession()) return;
-          setSessionKeySecret(sessionKey.secret());
-          setSessionKeyPublic(sessionKey.publicKey());
-          setChainLog((l) =>
-            appendChainLog(l, {
-              ts: Date.now(),
-              level: 'INFO',
-              msg: `TX ${r.txHash ?? 'UNKNOWN'} ok authorize_session_key delegate=${sessionKey.publicKey().slice(0, 8)}... [ASSASSIN] one-confirm mode enabled`,
-            })
-          );
-        } catch (e) {
-          if (!stillCurrentSession()) return;
-          const h = tryExtractTxHashFromError(e);
-          setChainLog((l) =>
-            appendChainLog(l, {
-              ts: Date.now(),
-              level: 'WARN',
-              msg: `assassin authorize_session_key failed${h ? ` (hash=${h})` : ''}; wallet-per-tx mode will continue: ${String(e)}`,
-            })
-          );
-        }
-      })();
+      pendingAssassinSessionKeyAuthRef.current = { sid, assassinAddr, token: sessionKeyPollToken };
     }
   };
 
@@ -3730,31 +3765,53 @@ export function ProofOfLifeGame(props: {
                  Power lines are down. Police can't reach him. Air rescue needs time.
               </p>
               <p className="text-amber-100/70 mt-2">
-                 <strong className="text-amber-300">You are the 911 Dispatcher.</strong> Using only a radio triangulation terminal and an emergency generator,
-                 you must keep Chad alive until dawn — turn 10.
+                 <strong className="text-amber-300">Game Modes:</strong> play as the Dispatcher in <strong className="text-amber-300">Solo Ops (1 player)</strong>,
+                 or split roles in <strong className="text-amber-300">Dual Operator (2 players)</strong> where one player is the Dispatcher and the other is the Assassin.
               </p>
+           </div>
+
+           {/* Modes */}
+           <div className="grid grid-cols-2 gap-4 text-[11px]">
+              <div className="space-y-2 border border-emerald-500/20 bg-emerald-500/5 p-3 rounded">
+                 <h4 className="text-emerald-300 font-bold tracking-wider uppercase border-b border-white/10 pb-1">Solo Ops (1 Player)</h4>
+                 <p className="text-emerald-100/70">
+                    You play the <strong className="text-emerald-300">Dispatcher</strong>. The Assassin is hidden and simulated, but still tracked with the same fog-of-war rules.
+                 </p>
+                 <p className="text-emerald-100/70">
+                    Your goal is to keep Chad alive until extraction (turn 10) or identify the Assassin with enough signal data.
+                 </p>
+              </div>
+
+              <div className="space-y-2 border border-amber-500/20 bg-amber-500/5 p-3 rounded">
+                 <h4 className="text-amber-300 font-bold tracking-wider uppercase border-b border-white/10 pb-1">Dual Operator (2 Players)</h4>
+                 <p className="text-amber-100/70">
+                    Player 1 is the <strong className="text-amber-300">Dispatcher</strong>. Player 2 is the <strong className="text-amber-300">Assassin</strong>.
+                 </p>
+                 <p className="text-amber-100/70">
+                    The Dispatcher uses pings and commands. The Assassin secretly moves each turn and submits hidden-position proofs.
+                 </p>
+              </div>
            </div>
 
            {/* Roles */}
            <div className="grid grid-cols-2 gap-4">
               <div className="space-y-2 border border-cyan-500/20 bg-cyan-500/5 p-3 rounded">
-                 <h4 className="text-cyan-300 font-bold tracking-wider uppercase border-b border-white/10 pb-1">You — Dispatcher</h4>
+                 <h4 className="text-cyan-300 font-bold tracking-wider uppercase border-b border-white/10 pb-1">Dispatcher Role</h4>
                  <ul className="space-y-1 text-cyan-100/70">
                     <li><strong className="text-cyan-300">PING TOWERS</strong> — each ping returns a signal distance from the Assassin to a tower, draining battery.</li>
                     <li><strong className="text-cyan-300">COMMAND CHAD</strong> — tell him where to move or hide using Command Override.</li>
                     <li><strong className="text-cyan-300">RECHARGE</strong> — skip a ping to restore generator power.</li>
-                    <li><strong className="text-cyan-300">CALL POLICE</strong> — guess the Assassin's exact tile to end the game instantly.</li>
                  </ul>
               </div>
 
               <div className="space-y-2 border border-fuchsia-500/20 bg-fuchsia-500/5 p-3 rounded">
-                 <h4 className="text-fuchsia-300 font-bold tracking-wider uppercase border-b border-white/10 pb-1">The Assassin — Hidden</h4>
+                 <h4 className="text-fuchsia-300 font-bold tracking-wider uppercase border-b border-white/10 pb-1">Assassin Role (Hidden)</h4>
                  <p className="text-fuchsia-100/70">
-                    His exact position is <strong className="text-fuchsia-300">never shown on the map</strong> — it's cryptographically hidden on-chain.
+                    In Dual Operator, the Assassin player's exact position is <strong className="text-fuchsia-300">never shown to the Dispatcher</strong> — it's cryptographically hidden on-chain.
                     Each ping only reveals how far he is from a tower, not where he is.
                  </p>
                  <p className="text-fuchsia-100/70 mt-1">
-                    Use multiple pings to narrow down his location by cross-referencing the distances.
+                    In Solo Ops, this role is simulated with the same hidden-position rules.
                  </p>
               </div>
            </div>
@@ -3779,8 +3836,7 @@ export function ProofOfLifeGame(props: {
               <div className="border border-emerald-500/20 bg-emerald-500/5 p-3 rounded">
                  <h4 className="text-emerald-400 font-bold tracking-wider mb-1">YOU WIN IF...</h4>
                  <ul className="space-y-1 text-emerald-100/60">
-                    <li>Chad survives to <strong className="text-emerald-300">Turn 10</strong> (police arrive), or</li>
-                    <li>You <strong className="text-emerald-300">CALL POLICE</strong> with the correct tile guess.</li>
+                    <li>Chad survives to <strong className="text-emerald-300">Turn 10</strong> (police arrive).</li>
                  </ul>
               </div>
               <div className="border border-red-500/20 bg-red-500/5 p-3 rounded">

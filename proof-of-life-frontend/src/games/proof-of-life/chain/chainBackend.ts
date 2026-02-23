@@ -701,6 +701,19 @@ export function mapChadCommandToChain(cmd: ChadCommand): any {
 }
 
 export function mapChainSessionToState(s: ChainSession): SessionState {
+  let outcome: SessionState['outcome'] = undefined;
+  if (s.ended) {
+    if (s.turn >= 10) {
+      outcome = 'win_extraction';
+    } else if (s.battery === 0) {
+      outcome = 'loss_blackout';
+    } else if (s.alpha === 0) {
+      outcome = 'loss_panic';
+    } else {
+      outcome = 'loss_caught';
+    }
+  }
+
   return {
     sessionId: s.session_id,
     mode: 'single',
@@ -714,6 +727,7 @@ export function mapChainSessionToState(s: ChainSession): SessionState {
     phase: normalizeTurnPhase((s as any).phase),
     turn_step: 'action',
     ended: s.ended,
+    outcome,
     log: [],
     moved_this_turn: s.moved_this_turn,
     alpha: s.alpha,
