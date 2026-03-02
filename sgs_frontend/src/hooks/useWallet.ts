@@ -4,6 +4,12 @@ import { devWalletService, DevWalletService } from '../services/devWalletService
 import { NETWORK, NETWORK_PASSPHRASE } from '../utils/constants';
 import type { ContractSigner } from '../types/signer';
 
+const MANUAL_WALLET_ID = 'manual-address';
+
+function isValidStellarAddress(address: string) {
+  return /^G[A-Z2-7]{55}$/.test(address.trim());
+}
+
 export function useWallet() {
   const {
     publicKey,
@@ -48,6 +54,24 @@ export function useWallet() {
     },
     [setWallet, setConnecting, setNetwork, setError]
   );
+
+  const connectManual = useCallback(async (address: string) => {
+    const normalized = address.trim().toUpperCase();
+
+    if (!normalized) {
+      setError('Enter a wallet address.');
+      throw new Error('Enter a wallet address.');
+    }
+
+    if (!isValidStellarAddress(normalized)) {
+      setError('Invalid Stellar wallet address. Expected a public key starting with G.');
+      throw new Error('Invalid Stellar wallet address.');
+    }
+
+    setError(null);
+    setWallet(normalized, MANUAL_WALLET_ID, 'manual');
+    setNetwork(NETWORK, NETWORK_PASSPHRASE);
+  }, [setError, setWallet, setNetwork]);
 
   /**
    * Switch between dev players
@@ -102,10 +126,14 @@ export function useWallet() {
     if (walletType === 'dev') {
       // Dev wallet uses the dev wallet service's signer
       return devWalletService.getSigner();
-    } else {
-      // For real wallet integration, implement Freighter or other wallet signing here
-      throw new Error('Real wallet signing not yet implemented. Use dev wallet for now.');
     }
+
+    if (walletType === 'manual') {
+      throw new Error('Manual address mode cannot sign transactions. Switch to a dev wallet to continue.');
+    }
+
+    // For real wallet integration, implement Freighter or other wallet signing here
+    throw new Error('Real wallet signing not yet implemented. Use dev wallet for now.');
   }, [isConnected, publicKey, walletType]);
 
   /**
@@ -145,6 +173,7 @@ export function useWallet() {
 
     // Actions
     connectDev,
+    connectManual,
     switchPlayer,
     disconnect,
     getContractSigner,

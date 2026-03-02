@@ -11,6 +11,7 @@ deployment.json
 
 # Bindings
 bindings/
+!proof-of-life-frontend/src/bindings/
 
 # Environment
 .env

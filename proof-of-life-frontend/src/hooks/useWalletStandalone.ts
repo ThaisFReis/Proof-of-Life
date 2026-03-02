@@ -8,6 +8,7 @@ import type { ContractSigner } from '../types/signer';
 import type { WalletError } from '@stellar/stellar-sdk/contract';
 
 const WALLET_ID = 'stellar-wallets-kit';
+const MANUAL_WALLET_ID = 'manual-address';
 let kitInitialized = false;
 
 function toWalletError(error?: { message: string; code: number }): WalletError | undefined {
@@ -38,6 +39,10 @@ function ensureKitInitialized(passphrase?: string) {
   if (passphrase) {
     StellarWalletsKit.setNetwork(resolveNetwork(passphrase));
   }
+}
+
+function isValidStellarAddress(address: string) {
+  return /^G[A-Z2-7]{55}$/.test(address.trim());
 }
 
 export function useWalletStandalone() {
@@ -104,6 +109,24 @@ export function useWalletStandalone() {
     storeDisconnect();
   }, [storeDisconnect]);
 
+  const connectManual = useCallback(async (address: string) => {
+    const normalized = address.trim().toUpperCase();
+
+    if (!normalized) {
+      setError('Enter a wallet address.');
+      throw new Error('Enter a wallet address.');
+    }
+
+    if (!isValidStellarAddress(normalized)) {
+      setError('Invalid Stellar wallet address. Expected a public key starting with G.');
+      throw new Error('Invalid Stellar wallet address.');
+    }
+
+    setError(null);
+    setWallet(normalized, MANUAL_WALLET_ID, 'manual');
+    setNetwork(NETWORK, NETWORK_PASSPHRASE);
+  }, [setError, setWallet, setNetwork]);
+
   const connectDev = useCallback(async (_playerNumber?: 1 | 2) => {
     setError('Dev wallets are not available in standalone mode.');
     throw new Error('Dev wallets are not available in standalone mode.');
@@ -123,6 +146,10 @@ export function useWalletStandalone() {
   const getContractSigner = useCallback((): ContractSigner => {
     if (!isConnected || !publicKey) {
       throw new Error('Wallet not connected');
+    }
+
+    if (walletType === 'manual') {
+      throw new Error('Manual address mode cannot sign transactions. Connect a wallet to continue.');
     }
 
     return {
@@ -167,7 +194,7 @@ export function useWalletStandalone() {
         }
       },
     };
-  }, [isConnected, publicKey, networkPassphrase]);
+  }, [isConnected, publicKey, networkPassphrase, walletType]);
 
   useEffect(() => {
     const bootstrap = async () => {
@@ -225,6 +252,7 @@ export function useWalletStandalone() {
 
     // Actions
     connect,
+    connectManual,
     refresh,
     disconnect,
     getContractSigner,
