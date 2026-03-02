@@ -2,7 +2,13 @@
 
 **A two-player asymmetric thriller on Stellar. Your position is a secret. Your moves are proofs.**
 
-[![Watch the demo](https://img.youtube.com/vi/GUpeO5FyWu4/maxresdefault.jpg)](https://youtu.be/GUpeO5FyWu4?si=7tSO3IPQGp3c9AI8)
+<p align="center">
+  <a href="https://youtu.be/GUpeO5FyWu4?si=7tSO3IPQGp3c9AI8">
+    <img src="https://img.youtube.com/vi/GUpeO5FyWu4/maxresdefault.jpg" alt="Proof of Life — Demo Video" width="720" />
+    <br/>
+    <strong>▶ Watch the Demo on YouTube</strong>
+  </a>
+</p>
 
 ---
 
