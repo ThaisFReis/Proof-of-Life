@@ -1,13 +1,4 @@
-# Stellar Game Studio
-
-Development Tools For Web3 Game Builders On Stellar.
-
-Ecosystem ready game templates and examples ready to scaffold into into your development workflow
-
-**Start here:** [Stellar Game Studio](https://jamesbachini.github.io/Stellar-Game-Studio/)
-
-
-## Proof of Life
+# Proof of Life
 
 **Proof of Life** is the flagship game built with this studio. It is a two-player asymmetric thriller set inside an abandoned mansion.
 
