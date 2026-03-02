@@ -1,47 +1,60 @@
 # Proof of Life
 
-**Proof of Life** is the flagship game built with this studio. It is a two-player asymmetric thriller set inside an abandoned mansion.
+**A two-player asymmetric thriller on Stellar. Your position is a secret. Your moves are proofs.**
 
-**[Watch the demo →](https://youtu.be/GUpeO5FyWu4?si=7tSO3IPQGp3c9AI8)**
+[![Watch the demo](https://img.youtube.com/vi/GUpeO5FyWu4/maxresdefault.jpg)](https://youtu.be/GUpeO5FyWu4?si=7tSO3IPQGp3c9AI8)
 
-### The Story
+---
+
+## The Story
 
 Chad is trapped inside a crumbling estate. Broken glass ceilings. Peeling wallpaper. A locked front door. Somewhere in those dark rooms, a silent Assassin is hunting him.
 
 Chad's only lifeline is you — the **Dispatcher**. You can't see inside the mansion. All you have is a radio, four signal towers on the perimeter, and a dwindling battery. Guide Chad to safety before the Assassin closes in.
 
-### Roles
+---
+
+## Roles
 
 | Role | What you do |
 |---|---|
 | **Dispatcher** | Remote operator. Ping the towers to triangulate the Assassin's position, then issue commands to Chad each turn. Survive 10 turns to extract Chad. |
 | **Assassin** | Move secretly through the mansion. Your position is hidden on-chain via a ZK commitment. Reach Chad before extraction. |
 
-### Rooms
+---
 
-The mansion is a 10×10 grid with nine interconnected areas: **Indoor Garden · Hallway · Living Room · Study · Library Wing · Dining Room · Grand Hall · Industrial Kitchen · Winter Garden (sealed)**. Each room has hide spots — closets, pantries, crawl spaces — where Chad can duck out of sight for up to two consecutive turns.
+## The Mansion
 
-### Turn Structure
+A 10×10 grid with nine interconnected areas:
+
+**Indoor Garden · Hallway · Living Room · Study · Library Wing · Dining Room · Grand Hall · Industrial Kitchen · Winter Garden (sealed)**
+
+Each room has hide spots — closets, pantries, crawl spaces — where Chad can duck out of sight for up to two consecutive turns.
+
+---
+
+## Gameplay
 
 Each round has two phases:
 
-1. **Dispatcher phase** — choose an action:
-   - `PING` — spend 20 battery to receive the squared distance from a tower to the Assassin (proven by ZK on-chain, exact position stays hidden)
-   - `RECHARGE` — recover 10 battery
-   - Then issue a command to Chad: `STAY`, `HIDE`, `WALK` (within a room), or `GO <room>` to move through a door
+**1. Dispatcher phase**
+- `PING` — spend 20 battery to receive the squared distance from a tower to the Assassin (proven by ZK on-chain, exact position stays hidden)
+- `RECHARGE` — recover 10 battery
+- Then issue a command to Chad: `STAY`, `HIDE`, `WALK` (within a room), or `GO <room>` to move through a door
 
-2. **Assassin phase** — move up to a limited number of steps through the mansion toward Chad's last known position
+**2. Assassin phase**
+- Move through the mansion toward Chad's last known position — hidden by a ZK commitment, invisible to the Dispatcher
 
 ### Win Conditions
 
 - **Dispatcher wins** — Chad survives 10 turns → *EXTRACTION COMPLETE*
-- **Assassin wins** — closes in on Chad → *SIGNAL LOST*, or Chad's morale collapses (panic) → *CHAD PANICS: RAN INTO THE FOREST*, or battery runs dry → *BLACKOUT*
+- **Assassin wins** — closes in on Chad → *SIGNAL LOST*, or Chad panics → *CHAD PANICS: RAN INTO THE FOREST*, or battery runs dry → *BLACKOUT*
 
-### The ZK Layer
+---
 
-The Assassin's position is committed on-chain using **Poseidon2** over BN254 — the Dispatcher never sees it directly. Each ping produces a **UltraHonk** proof (Noir circuits, verified by a Soroban smart contract) that proves the squared distance to a tower without revealing the Assassin's grid coordinates.
+## The ZK Layer
 
-Three circuits drive the proof pipeline:
+The Assassin's position is committed on-chain using **Poseidon2** over BN254. The Dispatcher never sees it directly. Each ping generates an **UltraHonk** proof (Noir circuits, verified by a Soroban smart contract) that proves the squared distance to a tower — without revealing the Assassin's grid coordinates.
 
 | Circuit | What it proves |
 |---|---|
@@ -49,199 +62,53 @@ Three circuits drive the proof pipeline:
 | `move_proof` | The Assassin's new committed position after a move is valid |
 | `turn_status` | The Assassin's position relative to Chad at end-of-turn |
 
-This means every claimed move and distance report is cryptographically verified on Stellar — no trusted server required.
+Every claimed move and distance report is cryptographically verified on Stellar — no trusted server required.
 
 ---
 
-## Why this exists
+## Running Locally
 
-Stellar Game Studio is a toolkit for shipping web3 games quickly and efficiently. It pairs Stellar smart contract patterns with a ready-made frontend stack and deployment scripts, so you can focus on game design and gameplay mechanics.
-
-## What you get
-
-- Battle-tested Soroban patterns for two-player games
-- A ecosystem ready mock game hub contract that standardizes lifecycle and scoring
-- Deterministic randomness guidance and reference implementations
-- One-command scaffolding for contracts + standalone frontend
-- Testnet setup that generates wallets, deploys contracts, and wires bindings
-- A production build flow that outputs a deployable frontend
-
-## Quick Start (Dev)
+### Prerequisites
 
 ```bash
-# Fork the repo, then:
+# Install Noir toolchain (pin to compatible versions)
+noirup --version 1.0.0-beta.18
+bbup -v 0.87.0
+```
+
+### Setup
+
+```bash
 git clone https://github.com/jamesbachini/Stellar-Game-Studio
 cd Stellar-Game-Studio
 bun install
-
-# Build + deploy contracts to testnet, generate bindings, write .env
-bun run setup
-
-# Scaffold a game + dev frontend
-bun run create my-game
-
-# Run the standalone dev frontend with testnet wallet switching
-bun run dev:game my-game
+bun run setup          # deploy contracts to testnet + generate bindings
 ```
 
-## Publish (Production)
+### Start the game
 
 ```bash
-# Export a production container and build it (uses CreitTech wallet kit v2)
-bun run publish my-game --build
-
-# Update runtime config in the output
-# dist/my-game-frontend/public/game-studio-config.js
-```
-
-## Project Structure
-
-```
-├── contracts/               # Soroban contracts for games + mock Game Hub
-├── circuits/                # Noir ZK circuits (ping_distance, turn_status, move_proof)
-├── zk-artifacts/            # Compiled circuit artifacts (SRS, VKs, witnesses)
-├── template_frontend/       # Standalone number-guess example frontend used by create
-├── <game>-frontend/         # Standalone game frontend (generated by create)
-├── sgs_frontend/            # Documentation site (builds to docs/)
-├── scripts/                 # Build & deployment automation
-└── bindings/                # Generated TypeScript bindings
-```
-
-## Commands
-
-```bash
-bun run setup                         # Build + deploy testnet contracts, generate bindings
-bun run build [game-name]             # Build all or selected contracts
-bun run deploy [game-name]            # Deploy all or selected contracts to testnet
-bun run bindings [game-name]          # Generate bindings for all or selected contracts
-bun run create my-game                # Scaffold contract + standalone frontend
-bun run dev:game my-game              # Run a standalone frontend with dev wallet switching
-bun run publish my-game --build       # Export + build production frontend
-
-# ZK (Proof of Life)
-bun run zk:install                    # Install Noir (nargo) and bb toolchain
-bun run zk:build                      # Compile circuits and generate proof/VK artifacts
-bun run zk:prover                     # Start the local prover server (default port 8787)
-bun run zk:wire                       # Wire on-chain verifiers with current VKs and WASM
-bun run zk:wire:auto                  # Auto-wire verifiers using deployment.json + .env
-```
-
-## Ecosystem Constraints
-
-- Every game must call `start_game` and `end_game` on the Game Hub contract:
-  Testnet: CB4VZAT2U3UC6XFK3N23SKRF2NDCMP3QHJYMCHHFMZO7MRQO6DQ2EMYG
-- Game Hub enforces exactly two players per session.
-- Keep randomness deterministic between simulation and submission.
-- Prefer temporary storage with a 30-day TTL for game state.
-
-## Notes
-
-- Dev wallets are generated during `bun run setup` and stored in the root `.env`.
-- Production builds read runtime config from `public/game-studio-config.js`.
-- Proof-of-Life ZK runtime troubleshooting and implementation notes: `ZK_RUNTIME_NOTES.md`
-- On-chain cost reduction strategies and verifier optimization: `ONCHAIN_COST_REDUCTION_PLAYBOOK.md`
-- ZK setup guide in Portuguese: `GUIA_ZK_PTBR.md` / `GUIA_ZK_PTBR_RESUMO.md`
-- Required ZK toolchain versions: `nargo 1.0.0-beta.18`, `bb 0.87.0`
-
-## Proof-of-Life ZK: Checklist (Copy/Paste)
-
-Use this sequence after contract/circuit changes to avoid `InvalidProof (#22)` and `ProofSessionMismatch (#18)`.
-
-```bash
-# 0) Go to project root
-cd Stellar-Game-Studio
-
-# 1) Build verifier WASM
-cd contracts/ultrahonk-verifier
-stellar contract build
-cd ../..
-
-# 2) Build ZK artifacts (circuits + proof/vk assets)
-bun run zk:build
-
-# 3) Deploy proof-of-life (if ABI/contract changed)
-bun run deploy proof-of-life
-
-# 4) Wire verifiers to the current game contract id (reads deployment.json + .env automatically)
-bun run zk:wire:auto
-# Or manually:
-# bun run zk:wire --admin-secret "..." --game-id "..." --network testnet \
-#   --verifier-wasm contracts/ultrahonk-verifier/target/wasm32v1-none/release/rs_soroban_ultrahonk.wasm \
-#   --vk-ping circuits/ping_distance/target/vk \
-#   --vk-turn circuits/turn_status/target/vk \
-#   --vk-move circuits/move_proof/target/vk
-
-# 5) Regenerate bindings
-bun run bindings proof-of-life
-
-# 6) Start prover and frontend
+# Terminal 1 — ZK prover server
 PORT=8788 bun run zk:prover
-# in another terminal
+
+# Terminal 2 — frontend
 cd proof-of-life-frontend && bun run dev
 ```
 
-### Multiline command pitfall
+### After contract or circuit changes
 
-When using `\` line continuation in `zsh/bash`, it must be the last character on the line.
-
-- Wrong: `\ ` (backslash + trailing space)
-- Wrong: splitting a path token into two lines
-- Symptoms: `unknown argument ...` or `missing value ...`
-
-### Current Testnet Status
-
-- Full end-to-end secure proof chain (ping + move + turn_status) has been confirmed to pass on testnet.
-- UltraHonk verifier is tuned to fit within the 400M instruction budget using `opt-level = "s"` + `lto = "fat"`.
-- DEV mode (insecure) is available as a demo path that bypasses ZK proof submission.
-- If you see `Error(Budget, ExceededLimit)`, rebuild circuits and rewire verifiers — stale artifacts are the most common cause.
-
-Interface for game hub:
-```
-#[contractclient(name = "GameHubClient")]
-pub trait GameHub {
-    fn start_game(
-        env: Env,
-        game_id: Address,
-        session_id: u32,
-        player1: Address,
-        player2: Address,
-        player1_points: i128,
-        player2_points: i128,
-    );
-
-    fn end_game(
-      env: Env,
-      session_id: u32,
-      player1_won: bool
-    );
-}
-```
-
-## Studio Reference
-
-Run the studio frontend locally (from `sgs_frontend/`):
 ```bash
-bun run dev
+cd contracts/ultrahonk-verifier && stellar contract build && cd ../..
+bun run zk:build               # recompile circuits
+bun run deploy proof-of-life   # redeploy contract
+bun run zk:wire:auto           # rewire on-chain verifiers
+bun run bindings proof-of-life # regenerate TypeScript bindings
 ```
 
-Build docs into `docs/`:
-```bash
-bun --cwd=sgs_frontend run build:docs
-```
+> **DEV mode** is available in the frontend to skip ZK proof submission — useful for demos and local testing.
 
-## Links
-https://developers.stellar.org/
-https://risczero.com/
-https://jamesbachini.com
-https://www.youtube.com/c/JamesBachini
-https://bachini.substack.com
-https://x.com/james_bachini
-https://www.linkedin.com/in/james-bachini/
-https://github.com/jamesbachini
+---
 
-## 📄 License
+## License
 
 MIT License - see LICENSE file
-
-
-**Built with ❤️ for Stellar developers**
